@@ -1,0 +1,72 @@
+{
+  "format": "aexrt.graph",
+  "version": 1,
+  "name": "add_relu_abi",
+  "element_count": 6,
+  "inputs": [
+    {
+      "name": "a",
+      "value": 0
+    },
+    {
+      "name": "b",
+      "value": 1
+    }
+  ],
+  "output": {
+    "name": "y",
+    "value": 3
+  },
+  "values": [
+    {
+      "id": 0,
+      "name": "a",
+      "dtype": "float32",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    {
+      "id": 1,
+      "name": "b",
+      "dtype": "float32",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    {
+      "id": 2,
+      "name": "sum",
+      "dtype": "float32",
+      "shape": [
+        2,
+        3
+      ]
+    },
+    {
+      "id": 3,
+      "name": "y",
+      "dtype": "float32",
+      "shape": [
+        2,
+        3
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "op": "Add",
+      "input0": 0,
+      "input1": 1,
+      "output": 2
+    },
+    {
+      "op": "Relu",
+      "input0": 2,
+      "input1": 0,
+      "output": 3
+    }
+  ]
+}

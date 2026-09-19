@@ -1,0 +1,30 @@
+# Build artifacts / local state
+build/
+__pycache__/
+*.pyc
+*.obj
+*.pdb
+*.exp
+*.lib
+*.exe
+*.dll
+
+# User models & compiled engines (site-specific, large, possibly proprietary)
+models/
+*.onnx
+*.aexrt
+*.aexyolo.json
+
+# Personal test images (game screenshots)
+build/tmp/realimg/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+
+# Python packaging residue
+*.egg-info/
+dist/

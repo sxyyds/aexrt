@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aexrt"
+version = "0.1.0"
+description = "AetherX Runtime: portable graph inference runtime with GPU acceleration backends"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23"]
+authors = [{name = "AetherX"}]
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+directml = ["torch-directml"]
+
+[project.scripts]
+aexrtc = "aexrt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
