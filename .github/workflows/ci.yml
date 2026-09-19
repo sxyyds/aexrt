@@ -37,7 +37,7 @@ jobs:
             --ignore=tests/test_runtime_fp16_physical_plan_validation.py \
             -k "not native_cpp and not aexrt_engine_omits_unreferenced"
 
-      - name: GPU end-to-end tests (self-hosted Windows + NVIDIA only)
-        if: runner.tags != nil || vars.AEXRT_GPU_CI == '1'
+      - name: GPU end-to-end tests (opt-in via repo variable AEXRT_GPU_CI=1)
+        if: vars.AEXRT_GPU_CI == '1'
         shell: bash
         run: pytest tests/ -q
