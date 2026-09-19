@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install package + test deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest numpy onnx onnxruntime pillow
+
+      - name: Compiler & planner tests (CPU-only, no GPU device required)
+        shell: bash
+        run: |
+          pytest tests/ -q \
+            --ignore=tests/test_arena_barrier_v2.py \
+            --ignore=tests/test_cpp_runtime_timing.py \
+            --ignore=tests/test_runtime_fp16_physical_plan_validation.py \
+            -k "not native_cpp and not aexrt_engine_omits_unreferenced"
+
+      - name: GPU end-to-end tests (self-hosted Windows + NVIDIA only)
+        if: runner.tags != nil || vars.AEXRT_GPU_CI == '1'
+        shell: bash
+        run: pytest tests/ -q

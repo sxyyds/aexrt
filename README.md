@@ -91,15 +91,15 @@ py tests\test_runtime.py
 examples\cpp\bin\native_yolo_package.exe examples\cs2V8_320.aexrt --runs 100 --profile
 ```
 
-## Detailed Documentation
+## Documentation
 
-- [`docs/AEXRT_ENGINE.md`](docs/AEXRT_ENGINE.md) — binary engine format
-- [`docs/NATIVE_D3D12.md`](docs/NATIVE_D3D12.md) — 38-round optimization log
-  (kernel rewrites, int8 quantization, LDS tiling, correctness fixes,
-  negative results with their laws)
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — design overview
-- [`docs/CPP_API.md`](docs/CPP_API.md) — C/C++ API reference
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — original roadmap
+Bilingual (EN + 简体中文) — see the [full index](docs/README.md):
+
+- Binary engine wire format — [EN](docs/AEXRT_ENGINE.md) / [中文](docs/AEXRT_ENGINE.zh-CN.md)
+- Architecture — [EN](docs/ARCHITECTURE.en.md) / [中文](docs/ARCHITECTURE.md)
+- Native C++ API — [EN](docs/CPP_API.md) / [中文](docs/CPP_API.zh-CN.md)
+- 38-round optimization log — [中文 (full)](docs/NATIVE_D3D12.md) / [EN (summary)](docs/NATIVE_D3D12.en.md)
+- Roadmap — [EN](docs/ROADMAP.en.md) / [中文](docs/ROADMAP.md)
 
 ## LLM Operators (Python backend)
 

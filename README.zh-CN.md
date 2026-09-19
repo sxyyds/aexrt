@@ -96,12 +96,13 @@ examples\cpp\bin\native_yolo_package.exe examples\cs2V8_320.aexrt --runs 100 --p
 
 ## 详细文档
 
-- [`docs/AEXRT_ENGINE.md`](docs/AEXRT_ENGINE.md)——二进制引擎线格式
-- [`docs/NATIVE_D3D12.md`](docs/NATIVE_D3D12.md)——38 轮优化全日志
-  （内核重写、int8 量化、LDS 分块、正确性修复、负结果及其定律）
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)——设计概览
-- [`docs/CPP_API.md`](docs/CPP_API.md)——C/C++ API 参考
-- [`docs/ROADMAP.md`](docs/ROADMAP.md)——原始路线图
+双语（EN + 简体中文）——完整索引见 [docs/README.md](docs/README.md)：
+
+- 二进制引擎线格式——[中文](docs/AEXRT_ENGINE.zh-CN.md) / [EN](docs/AEXRT_ENGINE.md)
+- 架构——[中文](docs/ARCHITECTURE.md) / [EN](docs/ARCHITECTURE.en.md)
+- 原生 C++ API——[中文](docs/CPP_API.zh-CN.md) / [EN](docs/CPP_API.md)
+- 38 轮优化日志——[中文（完整）](docs/NATIVE_D3D12.md) / [EN（摘要）](docs/NATIVE_D3D12.en.md)
+- 路线图——[中文](docs/ROADMAP.md) / [EN](docs/ROADMAP.en.md)
 
 ## LLM 算子（Python 后端）
 

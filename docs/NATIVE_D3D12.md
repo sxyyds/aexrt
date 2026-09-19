@@ -1,5 +1,7 @@
 # AEXRT Native D3D12
 
+**完整中文日志 | [English summary](NATIVE_D3D12.en.md)**
+
 ## 2026-09-18 第三十八轮：barrier 批量化 + 终局 1.08ms
 
 ### 时间分解（零拷贝模式）

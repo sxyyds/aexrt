@@ -1,35 +1,36 @@
-# AEXRT Native C++ API
+# AEXRT 原生 C++ API
 
-**English | [简体中文](CPP_API.zh-CN.md)**
+**[English](CPP_API.md) | 简体中文**
 
-AEXRT now has a pure native C++ runtime DLL. It does not include `Python.h`, does not require `python311.dll`, and does not load the Python extension module.
+AEXRT 提供纯原生 C++ 运行时 DLL：不包含 `Python.h`，不依赖
+`python311.dll`，不加载 Python 扩展模块。
 
-Current native C++ artifacts:
+当前原生 C++ 产物：
 
-- `native/aexrt.h`: stable C ABI.
-- `native/aexrt.hpp`: RAII C++ wrapper.
-- `native/aexrt_d3d12_runtime.cpp`: pure C++ D3D12 runtime implementation.
-- `build/native/aexrt_native_cpp.dll`: built native runtime.
-- `examples/cpp/native_relu_pure.cpp`: pure C++ example.
-- `examples/export_yolo_package.py`: ONNX-to-`.aexrt` compiler example.
+- `native/aexrt.h`：稳定的 C ABI。
+- `native/aexrt.hpp`：RAII C++ 封装。
+- `native/aexrt_d3d12_runtime.cpp`：纯 C++ D3D12 运行时实现。
+- `build/native/aexrt_native_cpp.dll`：构建出的原生运行时。
+- `examples/cpp/native_relu_pure.cpp`：纯 C++ 示例。
+- `examples/export_yolo_package.py`：ONNX → `.aexrt` 编译器示例。
 
-It currently covers these native D3D12 float32 graph paths:
+当前覆盖的原生 D3D12 float32 图路径：
 
 - `Relu`
 - `Relu -> Gelu`
 - `Add -> Relu`
-- prepared graph command replay
-- host float32 input/output
+- 预录制图命令回放
+- host float32 输入/输出
 
-## Build
+## 构建
 
-Build the pure native C++ runtime and example:
+构建纯原生 C++ 运行时与示例：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File examples\cpp\build_pure_native_relu.ps1
 ```
 
-Run:
+运行：
 
 ```powershell
 examples\cpp\bin\native_relu_pure.exe
@@ -38,7 +39,7 @@ examples\cpp\bin\native_relu_gelu_graph.exe
 examples\cpp\bin\native_add_relu_graph.exe
 ```
 
-Expected:
+预期输出：
 
 ```text
 AEXRT pure C++ native ReLU max diff: 0
@@ -47,33 +48,36 @@ AEXRT C++ Relu->Gelu graph max diff: 1.19209e-07
 AEXRT C++ Add->Relu graph max diff: 0
 ```
 
-The older `examples/cpp/native_relu.cpp` demonstrates loading symbols from the Python extension `.pyd`, but that is now a compatibility/demo path. The first-class C++ path is `native_relu_pure.cpp` + `aexrt_native_cpp.dll`.
+旧的 `examples/cpp/native_relu.cpp` 演示从 Python 扩展 `.pyd` 加载符号，
+现在只是兼容/演示路径。一等公民的 C++ 路径是 `native_relu_pure.cpp` +
+`aexrt_native_cpp.dll`。
 
-## Optional Python Extension Build
+## 可选的 Python 扩展构建
 
-The Python extension still exists:
+Python 扩展仍然存在：
 
 ```powershell
 py setup.py build_ext --inplace --force
 ```
 
-That build is for Python `InferenceSession(..., backend="native_d3d12")`, not for native C++ applications.
+该构建服务于 Python 的 `InferenceSession(..., backend="native_d3d12")`，
+与原生 C++ 应用无关。
 
-## Exported C ABI
+## 导出的 C ABI
 
-The declarations live in:
+声明位于：
 
 ```text
 native\aexrt.h
 ```
 
-The C++ RAII wrapper lives in:
+C++ RAII 封装位于：
 
 ```text
 native\aexrt.hpp
 ```
 
-Minimal C++ usage:
+最小 C++ 用法：
 
 ```cpp
 #include "aexrt.hpp"
@@ -89,7 +93,7 @@ int main() {
 }
 ```
 
-Multi-node graph usage:
+多节点图用法：
 
 ```cpp
 aexrt::Device device(0);
@@ -101,7 +105,7 @@ auto add_relu = aexrt::compile_add_relu_graph(device, a.size());
 auto y1 = aexrt::run(device, add_relu, a, b);
 ```
 
-Current exported functions:
+当前导出函数：
 
 ```cpp
 int aexrt_d3d12_probe();
@@ -157,10 +161,10 @@ int aexrt_yolo_run(
 void aexrt_yolo_destroy(AexrtYoloModel* model);
 ```
 
-## Binary Model Engine
+## 二进制模型引擎
 
-The first-class model deployment path is a binary `.aexrt` engine. Build it
-directly from ONNX; no JSON package is generated or loaded:
+一等公民的模型部署路径是二进制 `.aexrt` 引擎。直接从 ONNX 构建，不产
+生也不加载任何 JSON 包：
 
 ```powershell
 aexrtc build model.onnx -o model.aexrt
@@ -176,11 +180,10 @@ std::vector<float> input(model.input_element_count(), 0.0f);
 auto detections = aexrt::run_yolo(device, model, input, 100);
 ```
 
-Engine V1 carries the binary command stream, raw FP16/FP32 constants, fixed
-kernel and fusion plans, packed stride-2 3x3 weights, one activation arena, and
-the DXIL/PSO cache. The C++ loader validates the nine-section container and
-executes the serialized choices. See
-[`AEXRT_ENGINE.md`](AEXRT_ENGINE.md) for the exact wire format.
+引擎 V1 携带二进制命令流、原始 FP16/FP32 常量、固定 kernel 与融合计
+划、打包的 stride-2 3x3 权重、激活 arena 以及 DXIL/PSO 缓存。C++ 加载
+器校验九段容器并执行序列化的选择。精确线格式见
+[`AEXRT_ENGINE.zh-CN.md`](AEXRT_ENGINE.zh-CN.md)。
 
-The small `AexrtGraphDesc` API and its JSON graph loader remain compatibility
-interfaces for elementwise tests. They are not the model deployment workflow.
+小型 `AexrtGraphDesc` API 及其 JSON 图加载器保留为 elementwise 测试的
+兼容接口，不是模型部署工作流。
