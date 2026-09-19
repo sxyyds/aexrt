@@ -15,7 +15,7 @@ def ext_modules():
     return [
         Extension(
             "aexrt_native_d3d12",
-            sources=[str(ROOT / "native" / "aexrt_native_d3d12.cpp")],
+            sources=["native/aexrt_native_d3d12.cpp"],
             language="c++",
             extra_compile_args=["/std:c++17", "/EHsc", "/O2"],
             libraries=["d3d12", "dxgi", "dxguid", "d3dcompiler"],
