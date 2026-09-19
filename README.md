@@ -1,5 +1,12 @@
 # AetherX Runtime (AEXRT)
 
+**English | [简体中文](README.zh-CN.md)**
+
+A **fully self-developed D3D12 inference engine** — no CUDA, no DirectML, no
+external ML runtime dependencies. All compute kernels are hand-written HLSL
+compute shaders. ONNX models compile to a binary `.aexrt` file containing the
+complete GPU execution plan.
+
 ## .aexrt Binary Engine
 
 The first-class native model workflow is binary and does not require JSON:
@@ -19,14 +26,7 @@ V1 stores the binary command stream, raw constants, fixed kernel plan, packed
 weights, and GPU memory arena in one checksummed file. See
 [`docs/AEXRT_ENGINE.md`](docs/AEXRT_ENGINE.md) for the wire format and APIs.
 
-## What This Is
-
-AEXRT is a **fully self-developed D3D12 inference engine** — no CUDA, no
-DirectML, no external ML runtime dependencies. All kernels are hand-written
-HLSL compute shaders. The engine compiles ONNX models to a binary `.aexrt`
-file containing the complete GPU execution plan.
-
-### Architecture
+## Architecture
 
 - **Binary engine** (`.aexrt`): command stream + constants + kernel plan +
   packed weights + GPU memory arena in one checksummed file
@@ -105,3 +105,7 @@ examples\cpp\bin\native_yolo_package.exe examples\cs2V8_320.aexrt --runs 100 --p
 
 LayerNorm, GELU, Softmax, Embedding, SDPA, RoPE available via
 `InferenceSession(graph, backend="torch")`.
+
+## License
+
+[MIT](LICENSE)
