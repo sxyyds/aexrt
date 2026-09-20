@@ -1,0 +1,7 @@
+Could not open module param file '/sys/module/mali_kbase/parameters/large_page_conf'
+HAL: device + queue + pool ok
+HAL: 5 mapped buffers ok (type: unified device-local where available)
+HAL: SPIR-V pipeline created (int8 arithmetic shader)
+HAL: dispatch + fence ok
+verify: 64 outputs checked, 0 mismatches
+AEXRT-M Phase-1 HAL: PASS (pg16 quantized GEMM on Mali)

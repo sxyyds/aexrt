@@ -1,0 +1,32 @@
+#version 460
+/* AEXRT-M Phase-1: quantized GEMM kernel validation (explicit arithmetic).
+ * Per-thread: out = sum_g (sum_{k in g} a[k]*w[k]) * g_scale[g], pg16 scheme.
+ * Validates: int8 storage buffers, int8 arithmetic, per-16-group dequant,
+ * compute dispatch, readback. OpSDot path validated separately via SPIR-V. */
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer InA  { int8_t qa[]; };
+layout(set = 0, binding = 1) readonly buffer InW  { int8_t qw[]; };
+layout(set = 0, binding = 2) readonly buffer AScale { float a_gscale[]; }; /* group amax / 127 */
+layout(set = 0, binding = 3) readonly buffer WScale { float w_scale[]; };  /* per-oc amax / 127 */
+layout(set = 0, binding = 4) buffer OutBuf { float outv[]; };
+
+#define K 256u
+#define GROUPS (K / 16u)
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint oc  = gl_WorkGroupID.x;
+    float acc = 0.0;
+    for (uint g = 0u; g < GROUPS; ++g) {
+        int gsum = 0;
+        for (uint e = 0u; e < 16u; ++e) {
+            uint k = g * 16u + e;
+            gsum += int(qa[k]) * int(qw[oc * K + k]);
+        }
+        acc += float(gsum) * a_gscale[g];
+    }
+    outv[oc * 8u + (tid & 7u)] = acc * w_scale[oc];
+}
