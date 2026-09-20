@@ -1,7 +1,5 @@
 # 路线图
 
-**[中文](ROADMAP.md) | [English](ROADMAP.en.md)**
-
 ## v0.1 已完成
 
 - Graph IR

@@ -1,7 +1,5 @@
 # AEXRT Native C++ API
 
-**English | [简体中文](CPP_API.zh-CN.md)**
-
 AEXRT now has a pure native C++ runtime DLL. It does not include `Python.h`, does not require `python311.dll`, and does not load the Python extension module.
 
 Current native C++ artifacts:

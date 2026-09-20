@@ -1,7 +1,5 @@
 # AEXRT Binary Engine V1
 
-**English | [简体中文](AEXRT_ENGINE.zh-CN.md)**
-
 `.aexrt` is the first-class deployable model format for the native AEXRT
 runtime. The normal workflow is:
 
