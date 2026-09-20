@@ -1,5 +1,7 @@
 # AetherX Runtime 架构
 
+**[中文](ARCHITECTURE.md) | [English](ARCHITECTURE.en.md)**
+
 ## 核心方向
 
 AEXRT 的路线不是复制 DirectML 的单层设备 API，也不是把 DirectML 包一层，而是做一个可移植推理运行时：
