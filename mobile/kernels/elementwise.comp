@@ -1,0 +1,51 @@
+#version 460
+/* Elementwise ops: concat (NCHW), maxpool 2x2s2, resize nearest 2x, add. */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InA { float a[]; };
+layout(set = 0, binding = 1) readonly buffer InB { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { float o[]; };
+layout(push_constant) uniform PC {
+    uint op;       /* 0=concat 1=maxpool 2=resize 3=add */
+    uint elems;    /* total output elements */
+    uint ch_off;   /* concat: channel offset into input */
+    uint in_h, in_w;
+    uint out_c, out_h, out_w;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.elems) return;
+    if (pc.op == 3u) { /* add */
+        o[i] = a[i] + b[i];
+    } else if (pc.op == 0u) { /* concat: out is [n][c][h][w], a is source at ch_off */
+        /* assume input a has same spatial, channels laid contiguously */
+        o[i] = a[i];  /* branchless copy: caller pre-offsets via descriptor range */
+    } else if (pc.op == 1u) { /* maxpool 2x2 stride 2 */
+        uint plane = pc.in_h * pc.in_w;
+        uint c = i / plane;
+        uint pos = i - c * plane;
+        uint y = pos / pc.in_w;
+        uint x = pos - y * pc.in_w;
+        uint oy = y / 2u, ox = x / 2u; /* output dims = in/2 */
+        uint oplane = pc.out_h * pc.out_w;
+        uint oidx = c * oplane + oy * pc.out_w + ox;
+        float v = a[i];
+        float v1 = (y + 1u < pc.in_h) ? a[i + pc.in_w] : v;
+        float v2 = (x + 1u < pc.in_w) ? a[i + 1u] : v;
+        float v3 = (y + 1u < pc.in_h && x + 1u < pc.in_w) ? a[i + pc.in_w + 1u] : v;
+        o[oidx] = max(v, max(v1, max(v2, v3)));
+    } else if (pc.op == 4u) { /* silu */
+        float v = a[i];
+        o[i] = v / (1.0 + exp(-v));
+    } else if (pc.op == 2u) { /* resize nearest 2x up */
+        uint plane_in = pc.in_h * pc.in_w;
+        uint c = i / plane_in;
+        uint pos = i - c * plane_in;
+        uint y = pos / pc.in_w;
+        uint x = pos - y * pc.in_w;
+        uint oplane = pc.out_h * pc.out_w;
+        uint oy = y / 2u, ox = x / 2u;
+        uint oidx = c * oplane + oy * pc.out_w + ox;
+        o[oidx] = a[i];
+    }
+}

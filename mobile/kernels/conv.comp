@@ -1,0 +1,70 @@
+#version 460
+/* AEXRT-M generic fp16 conv: handles 1x1/3x3, stride 1/2, pad 0/1, SiLU optional.
+ * Layout: NCHW (values stored in row-major channel-first).
+ * Thread = 1 output position x 4 output channels (vec4). */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf  { float in_data[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf    { float w_data[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf    { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint in_c;
+    uint in_h;
+    uint in_w;
+    uint out_c;
+    uint out_h;
+    uint out_w;
+    uint kh;
+    uint kw;
+    uint sh;
+    uint sw;
+    uint ph;
+    uint pw;
+    uint silu;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint spatial = pc.out_h * pc.out_w;
+    uint oc4 = pc.out_c / 4u;
+    uint total = pc.batch * oc4 * spatial;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc4_idx = t % oc4;
+    uint n = t / oc4;
+    uint oh = pos / pc.out_w;
+    uint ow = pos - oh * pc.out_w;
+    uint oc0 = oc4_idx * 4u;
+
+    vec4 acc = vec4(b_data[oc0], b_data[oc0+1u], b_data[oc0+2u], b_data[oc0+3u]);
+    uint plane_in = pc.in_h * pc.in_w;
+    uint k_elems = pc.kh * pc.kw;
+
+    for (uint ic = 0u; ic < pc.in_c; ++ic) {
+        uint in_base = (n * pc.in_c + ic) * plane_in;
+                for (uint kk = 0u; kk < k_elems; ++kk) {
+            uint ky = kk / pc.kw;
+            uint kx = kk - ky * pc.kw;
+            int ih = int(oh * pc.sh + ky) - int(pc.ph);
+            int iw = int(ow * pc.sw + kx) - int(pc.pw);
+            if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+            float v = in_data[uint(in_base) + uint(ih) * pc.in_w + uint(iw)];
+            uint w_off = ((oc0) * pc.in_c + ic) * k_elems + kk;
+            acc.x += v * w_data[w_off];
+            acc.y += v * w_data[w_off + pc.in_c * k_elems];
+            acc.z += v * w_data[w_off + 2u * pc.in_c * k_elems];
+            acc.w += v * w_data[w_off + 3u * pc.in_c * k_elems];
+        }
+    }
+    if (pc.silu != 0u) {
+        acc = acc / (vec4(1.0) + exp(-acc));
+    }
+    uint out_base = (n * pc.out_c + oc0) * spatial + pos;
+    out_data[out_base] = acc.x;
+    out_data[out_base + spatial] = acc.y;
+    out_data[out_base + 2u * spatial] = acc.z;
+    out_data[out_base + 3u * spatial] = acc.w;
+}
