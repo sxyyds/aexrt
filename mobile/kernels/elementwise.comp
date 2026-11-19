@@ -1,51 +1,124 @@
 #version 460
-/* Elementwise ops: concat (NCHW), maxpool 2x2s2, resize nearest 2x, add. */
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M elementwise / small-window ops, POSITION-MAJOR.
+ *
+ * Every tensor access is [pos*ctot + ch_off + c], so a value may live inside
+ * a concat buffer (zero-copy producer placement) or be a slice view.
+ *
+ * Scalar ops (one output element per invocation):
+ *   1 maxpool | 2 resize nearest | 3 add | 4 silu | 5 sigmoid
+ * Vector ops (one output f16vec4 = 4 channels per invocation, used when the
+ * placement is 4-aligned; 4x fewer instructions and 8-byte coalesced access):
+ *   6 maxpool4 | 7 resize4 | 8 add4 | 9 silu4 | 10 sigmoid4
+ */
 layout(local_size_x = 128) in;
-layout(set = 0, binding = 0) readonly buffer InA { float a[]; };
-layout(set = 0, binding = 1) readonly buffer InB { float b[]; };
-layout(set = 0, binding = 2) writeonly buffer Out { float o[]; };
+layout(set = 0, binding = 0) readonly buffer InA  { float16_t a[]; };
+layout(set = 0, binding = 1) readonly buffer InB  { float16_t b[]; };
+layout(set = 0, binding = 2) writeonly buffer Out  { float16_t o[]; };
+layout(set = 0, binding = 3) readonly buffer InA4 { f16vec4 a4[]; };
+layout(set = 0, binding = 4) readonly buffer InB4 { f16vec4 b4[]; };
+layout(set = 0, binding = 5) writeonly buffer Out4 { f16vec4 o4[]; };
+
 layout(push_constant) uniform PC {
-    uint op;       /* 0=concat 1=maxpool 2=resize 3=add */
-    uint elems;    /* total output elements */
-    uint ch_off;   /* concat: channel offset into input */
-    uint in_h, in_w;
-    uint out_c, out_h, out_w;
+    uint op; uint elems;
+    uint in_h; uint in_w; uint out_h; uint out_w;
+    uint in_c; uint out_c;
+    uint in0_off; uint in1_off; uint out_off;
+    uint in0_ctot; uint in1_ctot; uint out_ctot;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw;
+    uint scale;
 } pc;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.elems) return;
-    if (pc.op == 3u) { /* add */
-        o[i] = a[i] + b[i];
-    } else if (pc.op == 0u) { /* concat: out is [n][c][h][w], a is source at ch_off */
-        /* assume input a has same spatial, channels laid contiguously */
-        o[i] = a[i];  /* branchless copy: caller pre-offsets via descriptor range */
-    } else if (pc.op == 1u) { /* maxpool 2x2 stride 2 */
-        uint plane = pc.in_h * pc.in_w;
-        uint c = i / plane;
-        uint pos = i - c * plane;
-        uint y = pos / pc.in_w;
-        uint x = pos - y * pc.in_w;
-        uint oy = y / 2u, ox = x / 2u; /* output dims = in/2 */
-        uint oplane = pc.out_h * pc.out_w;
-        uint oidx = c * oplane + oy * pc.out_w + ox;
-        float v = a[i];
-        float v1 = (y + 1u < pc.in_h) ? a[i + pc.in_w] : v;
-        float v2 = (x + 1u < pc.in_w) ? a[i + 1u] : v;
-        float v3 = (y + 1u < pc.in_h && x + 1u < pc.in_w) ? a[i + pc.in_w + 1u] : v;
-        o[oidx] = max(v, max(v1, max(v2, v3)));
-    } else if (pc.op == 4u) { /* silu */
-        float v = a[i];
-        o[i] = v / (1.0 + exp(-v));
-    } else if (pc.op == 2u) { /* resize nearest 2x up */
-        uint plane_in = pc.in_h * pc.in_w;
-        uint c = i / plane_in;
-        uint pos = i - c * plane_in;
-        uint y = pos / pc.in_w;
-        uint x = pos - y * pc.in_w;
-        uint oplane = pc.out_h * pc.out_w;
-        uint oy = y / 2u, ox = x / 2u;
-        uint oidx = c * oplane + oy * pc.out_w + ox;
-        o[oidx] = a[i];
+
+    /* ---- vector paths: i enumerates 4-channel groups ---- */
+    if (pc.op >= 6u) {
+        uint cg = pc.out_c >> 2;
+        uint c4 = i % cg;
+        uint pos = i / cg;
+        uint obase = (pos * pc.out_ctot + pc.out_off) >> 2;
+        if (pc.op == 8u) {               /* add4 */
+            vec4 va = vec4(a4[((pos * pc.in0_ctot + pc.in0_off) >> 2) + c4]);
+            vec4 vb = vec4(b4[((pos * pc.in1_ctot + pc.in1_off) >> 2) + c4]);
+            o4[obase + c4] = f16vec4(va + vb);
+            return;
+        }
+        if (pc.op == 9u || pc.op == 10u) {   /* silu4 / sigmoid4 */
+            vec4 v = vec4(a4[((pos * pc.in0_ctot + pc.in0_off) >> 2) + c4]);
+            float s = 1.0 / (1.0 + exp(-v.x));
+            vec4 r;
+            r.x = (pc.op == 9u) ? v.x * s : s;
+            s = 1.0 / (1.0 + exp(-v.y));
+            r.y = (pc.op == 9u) ? v.y * s : s;
+            s = 1.0 / (1.0 + exp(-v.z));
+            r.z = (pc.op == 9u) ? v.z * s : s;
+            s = 1.0 / (1.0 + exp(-v.w));
+            r.w = (pc.op == 9u) ? v.w * s : s;
+            o4[obase + c4] = f16vec4(r);
+            return;
+        }
+        uint oy = pos / pc.out_w;
+        uint ox = pos - oy * pc.out_w;
+        if (pc.op == 7u) {                /* resize4 */
+            uint iy = oy / pc.scale, ix = ox / pc.scale;
+            uint idx = ((iy * pc.in_w + ix) * pc.in0_ctot + pc.in0_off) >> 2;
+            o4[obase + c4] = a4[idx + c4];
+            return;
+        }
+        /* op 6: maxpool4 */
+        f16vec4 best = f16vec4(float16_t(-3.4e38));
+        for (uint dy = 0u; dy < pc.kh; ++dy) {
+            int sy = int(oy * pc.sh + dy) - int(pc.ph);
+            if (sy < 0 || sy >= int(pc.in_h)) continue;
+            for (uint dx = 0u; dx < pc.kw; ++dx) {
+                int sx = int(ox * pc.sw + dx) - int(pc.pw);
+                if (sx < 0 || sx >= int(pc.in_w)) continue;
+                uint idx = ((uint(sy) * pc.in_w + uint(sx)) * pc.in0_ctot + pc.in0_off) >> 2;
+                best = max(best, a4[idx + c4]);
+            }
+        }
+        o4[obase + c4] = best;
+        return;
     }
+
+    /* ---- scalar fallback (unaligned placement or C not multiple of 4) ---- */
+    uint c = i % pc.out_c;
+    uint pos = i / pc.out_c;
+    if (pc.op == 3u) {
+        float va = float(a[pos * pc.in0_ctot + pc.in0_off + c]);
+        float vb = float(b[pos * pc.in1_ctot + pc.in1_off + c]);
+        o[pos * pc.out_ctot + pc.out_off + c] = float16_t(va + vb);
+        return;
+    }
+    if (pc.op == 4u || pc.op == 5u) {
+        float v = float(a[pos * pc.in0_ctot + pc.in0_off + c]);
+        float s = 1.0 / (1.0 + exp(-v));
+        float r = (pc.op == 4u) ? v * s : s;
+        o[pos * pc.out_ctot + pc.out_off + c] = float16_t(r);
+        return;
+    }
+    uint oy = pos / pc.out_w;
+    uint ox = pos - oy * pc.out_w;
+    if (pc.op == 2u) {
+        uint iy = oy / pc.scale, ix = ox / pc.scale;
+        o[pos * pc.out_ctot + pc.out_off + c] =
+            a[(iy * pc.in_w + ix) * pc.in0_ctot + pc.in0_off + c];
+        return;
+    }
+    float best = -3.4e38;
+    for (uint dy = 0u; dy < pc.kh; ++dy) {
+        int sy = int(oy * pc.sh + dy) - int(pc.ph);
+        if (sy < 0 || sy >= int(pc.in_h)) continue;
+        for (uint dx = 0u; dx < pc.kw; ++dx) {
+            int sx = int(ox * pc.sw + dx) - int(pc.pw);
+            if (sx < 0 || sx >= int(pc.in_w)) continue;
+            float v = float(a[(uint(sy) * pc.in_w + uint(sx)) * pc.in0_ctot
+                             + pc.in0_off + c]);
+            best = max(best, v);
+        }
+    }
+    o[pos * pc.out_ctot + pc.out_off + c] = float16_t(best);
 }

@@ -1,0 +1,130 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M conv fp16-dot: 1 position x 8 OC, like conv_i8, but multiplications
+ * and each 16-channel partial sum stay in fp16 (packed HFMA2 on Mali/Adreno),
+ * then accumulate into fp32. Storage is fp16, so this is the same precision
+ * class as NVIDIA tensor-core style fp16 x fp16 -> fp32 with 16-deep blocks.
+ * The fp32 kernel remains for the 3-channel stem and as an accuracy fallback.
+ */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { f16vec4 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf  { f16vec4 w4[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf  { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf{ f16vec4 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS   { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS    { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS { float16_t o_s[]; };
+
+float16_t dot16(f16vec4 v0, f16vec4 v1, f16vec4 v2, f16vec4 v3,
+                f16vec4 w0, f16vec4 w1, f16vec4 w2, f16vec4 w3) {
+    return dot(v0, w0) + dot(v1, w1) + dot(v2, w2) + dot(v3, w3);
+}
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint spatial = pc.out_h * pc.out_w;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * spatial;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint oh = pos / pc.out_w;
+    uint ow = pos - oh * pc.out_w;
+    uint oc0 = oc8_idx * 8u;
+
+    vec4 accA = vec4(0.0), accB = vec4(0.0);
+    if (oc0 < pc.out_c)      accA.x = b_data[pc.b_off + oc0];
+    if (oc0 + 1u < pc.out_c) accA.y = b_data[pc.b_off + oc0 + 1u];
+    if (oc0 + 2u < pc.out_c) accA.z = b_data[pc.b_off + oc0 + 2u];
+    if (oc0 + 3u < pc.out_c) accA.w = b_data[pc.b_off + oc0 + 3u];
+    if (oc0 + 4u < pc.out_c) accB.x = b_data[pc.b_off + oc0 + 4u];
+    if (oc0 + 5u < pc.out_c) accB.y = b_data[pc.b_off + oc0 + 5u];
+    if (oc0 + 6u < pc.out_c) accB.z = b_data[pc.b_off + oc0 + 6u];
+    if (oc0 + 7u < pc.out_c) accB.w = b_data[pc.b_off + oc0 + 7u];
+
+    uint C = pc.in_c;
+    uint C4 = C >> 2;
+    uint R = C * pc.kh * pc.kw;
+    uint row_v4 = ((R + 3u) & ~3u) >> 2;
+    uint wbase = pc.w_off + oc0 * row_v4;
+    uint groups = C4 >> 2;              /* 16-channel groups */
+    uint tail = C4 & 3u;
+
+    for (uint kk = 0u; kk < pc.kh * pc.kw; ++kk) {
+        uint ky = kk / pc.kw;
+        uint kx = kk - ky * pc.kw;
+        int ih = int(oh * pc.sh + ky) - int(pc.ph);
+        int iw = int(ow * pc.sw + kx) - int(pc.pw);
+        if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+        uint ibase = ((uint(ih) * pc.in_w + uint(iw)) * pc.in_ctot + pc.in_off) >> 2;
+        uint wrow = wbase + kk * C4;
+
+        for (uint g = 0u; g < groups; ++g) {
+            uint o = g * 4u;
+            f16vec4 v0 = in4[ibase + o + 0u];
+            f16vec4 v1 = in4[ibase + o + 1u];
+            f16vec4 v2 = in4[ibase + o + 2u];
+            f16vec4 v3 = in4[ibase + o + 3u];
+            uint b0 = wrow + o;
+            uint b1 = b0 + row_v4;
+            uint b2 = b1 + row_v4;
+            uint b3 = b2 + row_v4;
+            uint b4 = b3 + row_v4;
+            uint b5 = b4 + row_v4;
+            uint b6 = b5 + row_v4;
+            uint b7 = b6 + row_v4;
+            accA.x += float(dot16(v0, v1, v2, v3, w4[b0], w4[b0 + 1u], w4[b0 + 2u], w4[b0 + 3u]));
+            accA.y += float(dot16(v0, v1, v2, v3, w4[b1], w4[b1 + 1u], w4[b1 + 2u], w4[b1 + 3u]));
+            accA.z += float(dot16(v0, v1, v2, v3, w4[b2], w4[b2 + 1u], w4[b2 + 2u], w4[b2 + 3u]));
+            accA.w += float(dot16(v0, v1, v2, v3, w4[b3], w4[b3 + 1u], w4[b3 + 2u], w4[b3 + 3u]));
+            accB.x += float(dot16(v0, v1, v2, v3, w4[b4], w4[b4 + 1u], w4[b4 + 2u], w4[b4 + 3u]));
+            accB.y += float(dot16(v0, v1, v2, v3, w4[b5], w4[b5 + 1u], w4[b5 + 2u], w4[b5 + 3u]));
+            accB.z += float(dot16(v0, v1, v2, v3, w4[b6], w4[b6 + 1u], w4[b6 + 2u], w4[b6 + 3u]));
+            accB.w += float(dot16(v0, v1, v2, v3, w4[b7], w4[b7 + 1u], w4[b7 + 2u], w4[b7 + 3u]));
+        }
+        for (uint o = groups * 4u; o < C4; ++o) {   /* 4..12 channel tail */
+            f16vec4 v = in4[ibase + o];
+            for (uint ln = 0u; ln < 8u; ++ln) {
+                float f = float(dot(v, w4[wrow + o + ln * row_v4]));
+                if (ln == 0u) accA.x += f;
+                else if (ln == 1u) accA.y += f;
+                else if (ln == 2u) accA.z += f;
+                else if (ln == 3u) accA.w += f;
+                else if (ln == 4u) accB.x += f;
+                else if (ln == 5u) accB.y += f;
+                else if (ln == 6u) accB.z += f;
+                else accB.w += f;
+            }
+        }
+    }
+
+    if (pc.silu == 1u) {
+        accA = accA / (vec4(1.0) + exp(-accA));
+        accB = accB / (vec4(1.0) + exp(-accB));
+    } else if (pc.silu == 2u) {
+        accA = vec4(1.0) / (vec4(1.0) + exp(-accA));
+        accB = vec4(1.0) / (vec4(1.0) + exp(-accB));
+    }
+    uint obase = pos * pc.out_ctot + pc.out_off + oc0;
+    if ((pc.out_ctot & 3u) == 0u && (pc.out_off & 3u) == 0u && oc0 + 8u <= pc.out_c) {
+        out4[obase >> 2] = f16vec4(accA);
+        out4[(obase + 4u) >> 2] = f16vec4(accB);
+    } else {
+        for (uint ln = 0u; ln < 8u; ++ln) {
+            if (oc0 + ln >= pc.out_c) break;
+            float v = ln < 4u ? accA[ln & 3u] : accB[ln & 3u];
+            o_s[obase + ln] = float16_t(v);
+        }
+    }
+}

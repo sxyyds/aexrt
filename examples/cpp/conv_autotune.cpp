@@ -494,12 +494,18 @@ int main(int argc, char** argv) {
         if (!map_path.empty()) {
             std::ofstream m(map_path, std::ios::binary);
             m << "{\n";
+            size_t emitted = 0;
             for (size_t i = 0; i < all_winners.size(); ++i) {
+                /* Fusion-group commands are owned by the group kernel; a
+                 * standalone override produces an inconsistent physical plan
+                 * (runtime fail-closed, compile-time "not a conv" rejection). */
+                if (grouped_commands.count(all_winners[i].first) != 0) continue;
                 m << "    \"" << all_winners[i].first << "\": " << all_winners[i].second
-                  << (i + 1 < all_winners.size() ? "," : "") << "\n";
+                  << (++emitted < all_winners.size() ? "," : "") << "\n";
             }
             m << "}\n";
-            std::cout << "saved: " << map_path << " (" << all_winners.size() << " overrides)\n";
+            std::cout << "saved: " << map_path << " (" << emitted << " overrides, "
+                      << grouped_commands.size() << " in-fusion skipped)\n";
         }
         if (!header_path.empty()) {
             std::ofstream h(header_path, std::ios::binary);

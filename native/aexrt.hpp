@@ -477,6 +477,33 @@ inline std::vector<float> run(Device& device, Graph& graph, const std::vector<st
     return output;
 }
 
+/* Persistent mapped input pointer: fill it directly and pass it to
+ * run_yolo_ptr to skip the per-frame host memcpy. */
+inline bool override_conv_algorithm(YoloModel& model, uint32_t command_index,
+                                    uint32_t algorithm_id) {
+    return aexrt_yolo_override_conv_algorithm(model.get(), command_index, algorithm_id) != 0;
+}
+
+inline void* input_ptr(YoloModel& model, uint64_t* out_elements = nullptr) {
+    return aexrt_yolo_input_ptr(model.get(), out_elements);
+}
+
+inline std::vector<AexrtYoloDetection> run_yolo_ptr(
+    Device& device,
+    YoloModel& model,
+    const float* input,
+    uint64_t input_elements,
+    uint32_t max_detections = 100) {
+    std::vector<AexrtYoloDetection> detections(max_detections);
+    uint32_t count = 0;
+    if (!aexrt_yolo_run(device.get(), model.get(), input, input_elements,
+                        detections.data(), max_detections, &count)) {
+        throw std::runtime_error("AEXRT YOLO run failed");
+    }
+    detections.resize(count);
+    return detections;
+}
+
 inline std::vector<AexrtYoloDetection> run_yolo(
     Device& device,
     YoloModel& model,

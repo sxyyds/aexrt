@@ -1,0 +1,166 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M Winograd F(2x2,3x3), 2-OC/thread variant (Mali register budget).
+ *
+ * One invocation computes a 2x2 output tile x 2 OC.  The 4x4 input tile is
+ * transformed with B^T d B (fp32), multiplied by the exporter-precomputed
+ * U = G g G^T (fp16, layout [p][ic][oc]) and inverse-transformed with A^T M A.
+ * Per 4 input channels: 32 adds for the transform + 16 vec2 FMAs (64 MAC)
+ * versus 4 OC x 4 outputs x 9 taps = 144 MAC for direct conv.  Weights for
+ * the four OC lanes are contiguous (f16vec2), so a warp of adjacent tiles
+ * broadcasts them through L1.
+ *
+ * Only 3x3 stride-1 pad-1 layers with ic%4==0 and oc%4==0 are exported as
+ * type 10; everything else keeps the direct f16 kernels.
+ */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { f16vec2 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf  { f16vec2 w2[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf  { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf{ f16vec2 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS   { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS    { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS { float16_t o_s[]; };
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+} pc;
+
+float load_d(int y, int x, uint ch) {
+    if (y < 0 || y >= int(pc.in_h) || x < 0 || x >= int(pc.in_w)) return 0.0;
+    return float(in_s[(uint(y) * pc.in_w + uint(x)) * pc.in_ctot + pc.in_off + ch]);
+}
+
+void main() {
+    uint tile_w = (pc.out_w + 1u) / 2u;
+    uint tile_h = (pc.out_h + 1u) / 2u;
+    uint tiles = tile_w * tile_h;
+    uint oc2 = (pc.out_c + 1u) / 2u;
+    uint total = pc.batch * oc2 * tiles;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    uint tile = idx % tiles;
+    uint t = idx / tiles;
+    uint oc2_idx = t % oc2;
+    uint n = t / oc2;
+    uint ty = tile / tile_w;
+    uint tx = tile - ty * tile_w;
+    uint oh0 = ty * 2u, ow0 = tx * 2u;
+    uint oc0 = oc2_idx * 2u;
+
+    vec2 m0 = vec2(0.0), m1 = vec2(0.0), m2 = vec2(0.0), m3 = vec2(0.0);
+    vec2 m4 = vec2(0.0), m5 = vec2(0.0), m6 = vec2(0.0), m7 = vec2(0.0);
+    vec2 m8 = vec2(0.0), m9 = vec2(0.0), m10 = vec2(0.0), m11 = vec2(0.0);
+    vec2 m12 = vec2(0.0), m13 = vec2(0.0), m14 = vec2(0.0), m15 = vec2(0.0);
+
+    const uint O = pc.out_c;
+    const uint C = pc.in_c;
+    const uint pstride = (C * O) >> 1;    /* f16vec2s per transform point */
+
+    for (uint ic = 0u; ic < C; ++ic) {
+        int y0 = int(oh0) - 1, x0 = int(ow0) - 1;
+        float d00 = load_d(y0 + 0, x0 + 0, ic), d01 = load_d(y0 + 0, x0 + 1, ic);
+        float d02 = load_d(y0 + 0, x0 + 2, ic), d03 = load_d(y0 + 0, x0 + 3, ic);
+        float d10 = load_d(y0 + 1, x0 + 0, ic), d11 = load_d(y0 + 1, x0 + 1, ic);
+        float d12 = load_d(y0 + 1, x0 + 2, ic), d13 = load_d(y0 + 1, x0 + 3, ic);
+        float d20 = load_d(y0 + 2, x0 + 0, ic), d21 = load_d(y0 + 2, x0 + 1, ic);
+        float d22 = load_d(y0 + 2, x0 + 2, ic), d23 = load_d(y0 + 2, x0 + 3, ic);
+        float d30 = load_d(y0 + 3, x0 + 0, ic), d31 = load_d(y0 + 3, x0 + 1, ic);
+        float d32 = load_d(y0 + 3, x0 + 2, ic), d33 = load_d(y0 + 3, x0 + 3, ic);
+        /* V = B^T d B written directly from d: saves the 16 live t values
+         * and keeps the weight live range to one f16vec2 at a time. */
+        float v00 = d00 - d20 - d02 + d22;
+        float v01 = d01 - d21 + d02 - d22;
+        float v02 = d02 - d22 - d01 + d21;
+        float v03 = d01 - d21 - d03 + d23;
+        float v10 = d10 + d20 - d12 - d22;
+        float v11 = d11 + d21 + d12 + d22;
+        float v12 = d12 + d22 - d11 - d21;
+        float v13 = d11 + d21 - d13 - d23;
+        float v20 = d20 - d10 - d22 + d12;
+        float v21 = d21 - d11 + d22 - d12;
+        float v22 = d22 - d12 - d21 + d11;
+        float v23 = d21 - d11 - d23 + d13;
+        float v30 = d10 - d30 - d12 + d32;
+        float v31 = d11 - d31 + d12 - d32;
+        float v32 = d12 - d32 - d11 + d31;
+        float v33 = d11 - d31 - d13 + d33;
+
+        uint wr = pc.w_off * 2u + ((ic * O + oc0) >> 1);
+        m0 += v00 * vec2(w2[wr + 0u * pstride]);
+        m1 += v01 * vec2(w2[wr + 1u * pstride]);
+        m2 += v02 * vec2(w2[wr + 2u * pstride]);
+        m3 += v03 * vec2(w2[wr + 3u * pstride]);
+        m4 += v10 * vec2(w2[wr + 4u * pstride]);
+        m5 += v11 * vec2(w2[wr + 5u * pstride]);
+        m6 += v12 * vec2(w2[wr + 6u * pstride]);
+        m7 += v13 * vec2(w2[wr + 7u * pstride]);
+        m8 += v20 * vec2(w2[wr + 8u * pstride]);
+        m9 += v21 * vec2(w2[wr + 9u * pstride]);
+        m10 += v22 * vec2(w2[wr + 10u * pstride]);
+        m11 += v23 * vec2(w2[wr + 11u * pstride]);
+        m12 += v30 * vec2(w2[wr + 12u * pstride]);
+        m13 += v31 * vec2(w2[wr + 13u * pstride]);
+        m14 += v32 * vec2(w2[wr + 14u * pstride]);
+        m15 += v33 * vec2(w2[wr + 15u * pstride]);
+    }
+
+    /* A^T M A: rows -> z, columns -> 2x2. */
+    vec2 z00 = m0 + m4 + m8;
+    vec2 z01 = m1 + m5 + m9;
+    vec2 z02 = m2 + m6 + m10;
+    vec2 z03 = m3 + m7 + m11;
+    vec2 z10 = m4 - m8 - m12;
+    vec2 z11 = m5 - m9 - m13;
+    vec2 z12 = m6 - m10 - m14;
+    vec2 z13 = m7 - m11 - m15;
+    vec2 y00 = z00 + z01 + z02;
+    vec2 y01 = z01 - z02 - z03;
+    vec2 y10 = z10 + z11 + z12;
+    vec2 y11 = z11 - z12 - z13;
+
+    vec2 bias4 = vec2(0.0);
+    if (oc0 < pc.out_c)      bias4.x = b_data[pc.b_off + oc0];
+    if (oc0 + 1u < pc.out_c) bias4.y = b_data[pc.b_off + oc0 + 1u];
+    y00 += bias4; y01 += bias4; y10 += bias4; y11 += bias4;
+
+    if (pc.silu == 1u) {
+        y00 = y00 / (vec2(1.0) + exp(-y00));
+        y01 = y01 / (vec2(1.0) + exp(-y01));
+        y10 = y10 / (vec2(1.0) + exp(-y10));
+        y11 = y11 / (vec2(1.0) + exp(-y11));
+    } else if (pc.silu == 2u) {
+        y00 = vec2(1.0) / (vec2(1.0) + exp(-y00));
+        y01 = vec2(1.0) / (vec2(1.0) + exp(-y01));
+        y10 = vec2(1.0) / (vec2(1.0) + exp(-y10));
+        y11 = vec2(1.0) / (vec2(1.0) + exp(-y11));
+    }
+
+    bool vec_ok = false;   /* 2 OC are not contiguous in NCHW output */
+    if (oh0 < pc.out_h && ow0 < pc.out_w) {
+        uint p = (oh0 * pc.out_w + ow0) * pc.out_ctot + pc.out_off + oc0;
+        if (vec_ok) out4[p >> 2] = f16vec2(y00);
+        else for (uint l = 0u; l < 2u; ++l) if (oc0 + l < pc.out_c) o_s[p + l] = float16_t(y00[l]);
+    }
+    if (oh0 < pc.out_h && ow0 + 1u < pc.out_w) {
+        uint p = (oh0 * pc.out_w + ow0 + 1u) * pc.out_ctot + pc.out_off + oc0;
+        if (vec_ok) out4[p >> 2] = f16vec2(y01);
+        else for (uint l = 0u; l < 2u; ++l) if (oc0 + l < pc.out_c) o_s[p + l] = float16_t(y01[l]);
+    }
+    if (oh0 + 1u < pc.out_h && ow0 < pc.out_w) {
+        uint p = ((oh0 + 1u) * pc.out_w + ow0) * pc.out_ctot + pc.out_off + oc0;
+        if (vec_ok) out4[p >> 2] = f16vec2(y10);
+        else for (uint l = 0u; l < 2u; ++l) if (oc0 + l < pc.out_c) o_s[p + l] = float16_t(y10[l]);
+    }
+    if (oh0 + 1u < pc.out_h && ow0 + 1u < pc.out_w) {
+        uint p = ((oh0 + 1u) * pc.out_w + ow0 + 1u) * pc.out_ctot + pc.out_off + oc0;
+        if (vec_ok) out4[p >> 2] = f16vec2(y11);
+        else for (uint l = 0u; l < 2u; ++l) if (oc0 + l < pc.out_c) o_s[p + l] = float16_t(y11[l]);
+    }
+}

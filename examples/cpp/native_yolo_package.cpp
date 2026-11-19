@@ -7,8 +7,36 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
+
+static bool load_algo_map(const std::string& path,
+                          std::vector<std::pair<uint32_t, uint32_t>>& out) {
+    std::ifstream in(path);
+    if (!in) return false;
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    size_t pos = 0;
+    while ((pos = text.find('"', pos)) != std::string::npos) {
+        const size_t close = text.find('"', pos + 1);
+        if (close == std::string::npos) break;
+        const size_t colon = text.find(':', close);
+        if (colon == std::string::npos) break;
+        const size_t end = text.find_first_of(",}", colon + 1);
+        if (end == std::string::npos) break;
+        try {
+            out.emplace_back(static_cast<uint32_t>(std::stoul(text.substr(pos + 1, close - pos - 1))),
+                             static_cast<uint32_t>(std::stoul(text.substr(colon + 1, end - colon - 1))));
+        } catch (...) {
+            return false;
+        }
+        pos = end;
+    }
+    return true;
+}
 
 static bool ends_with_ci(const std::string& text, const std::string& suffix) {
     if (suffix.size() > text.size()) return false;
@@ -36,6 +64,11 @@ int main(int argc, char** argv) {
     std::string package_path = "examples\\cs2V8_320.aexrt";
     uint32_t benchmark_runs = 0;
     bool profile = false;
+    bool zero_copy = false;
+    std::string algo_map_path;
+    std::string dump_dets_path;
+    std::string input_path;
+    uint32_t max_dets = 16;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--runs") {
@@ -46,8 +79,34 @@ int main(int argc, char** argv) {
             benchmark_runs = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--profile") {
             profile = true;
+        } else if (arg == "--zero-copy") {
+            zero_copy = true;
+        } else if (arg == "--algo-map") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --algo-map\n";
+                return 1;
+            }
+            algo_map_path = argv[++i];
+        } else if (arg == "--max-dets") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --max-dets\n";
+                return 1;
+            }
+            max_dets = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--input") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --input\n";
+                return 1;
+            }
+            input_path = argv[++i];
+        } else if (arg == "--dump-dets") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --dump-dets\n";
+                return 1;
+            }
+            dump_dets_path = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "native_yolo_package.exe [model.onnx|model.aexrt] [--runs N] [--profile]\n";
+            std::cout << "native_yolo_package.exe [model.onnx|model.aexrt] [--runs N] [--profile] [--zero-copy] [--algo-map file.json] [--dump-dets file.bin]\n";
             return 0;
         } else {
             package_path = arg;
@@ -80,13 +139,39 @@ int main(int argc, char** argv) {
               << " unsupported_commands=" << model.unsupported_prepared_command_count()
               << " executable=" << (model.executable() ? 1 : 0) << "\n";
 
+    if (!algo_map_path.empty()) {
+        std::vector<std::pair<uint32_t, uint32_t>> overrides;
+        if (!load_algo_map(algo_map_path, overrides)) {
+            std::cerr << "failed to parse algo map: " << algo_map_path << "\n";
+            return 2;
+        }
+        uint32_t applied = 0;
+        for (const auto& item : overrides) {
+            if (!aexrt::override_conv_algorithm(model, item.first, item.second)) {
+                std::cerr << "algo override failed: cmd#" << item.first
+                          << " alg=" << item.second << "\n";
+                return 2;
+            }
+            ++applied;
+        }
+        std::cout << "AEXRT C++ algo overrides applied: " << applied << "\n";
+    }
+
     if (!model.executable()) {
         return 0;
     }
 
     if (model.package_mode() == AEXRT_YOLO_PACKAGE_NATIVE_D3D12_GRAPH) {
         std::vector<float> input(model.input_element_count(), 0.0f);
-        auto detections = aexrt::run_yolo(device, model, input, 16);
+        if (!input_path.empty()) {
+            std::ifstream in(input_path, std::ios::binary);
+            if (!in) { std::cerr << "cannot open input " << input_path << "\n"; return 1; }
+            in.read(reinterpret_cast<char*>(input.data()),
+                    static_cast<std::streamsize>(input.size() * sizeof(float)));
+            if (!in) { std::cerr << "short input file " << input_path << "\n"; return 1; }
+            std::cout << "AEXRT C++ input: " << input.size() << " floats from " << input_path << "\n";
+        }
+        auto detections = aexrt::run_yolo(device, model, input, max_dets);
         std::cout << "AEXRT C++ TileFlow: conv1x1=" << model.tileflow_conv1x1_count()
                   << " spatial3x3=" << model.tileflow_3x3_spatial_count()
                   << " pack4_3x3=" << model.tileflow_3x3_pack4_count()
@@ -109,6 +194,19 @@ int main(int argc, char** argv) {
                   << " c2f_tail=" << model.c2f_tail_residual_fusion_count()
                   << " head_fusion=" << (model.head_fusion_enabled() ? 1 : 0)
                   << "\n";
+        const float* run_input = input.data();
+        uint64_t run_elements = static_cast<uint64_t>(input.size());
+        if (zero_copy) {
+            uint64_t mapped_elements = 0;
+            void* mapped = aexrt::input_ptr(model, &mapped_elements);
+            if (mapped && mapped_elements >= input.size()) {
+                std::memcpy(mapped, input.data(), input.size() * sizeof(float));
+                run_input = static_cast<const float*>(mapped);
+                std::cout << "AEXRT C++ zero-copy input: mapped\n";
+            } else {
+                std::cout << "AEXRT C++ zero-copy input: unavailable, falling back\n";
+            }
+        }
         if (benchmark_runs != 0) {
             double total_ms = 0.0;
             double total_memcpy_ms = 0.0;
@@ -118,7 +216,9 @@ int main(int argc, char** argv) {
             uint32_t timed_runs = 0;
             for (uint32_t i = 0; i < benchmark_runs; ++i) {
                 const auto t0 = std::chrono::high_resolution_clock::now();
-                detections = aexrt::run_yolo(device, model, input, 16);
+                detections = zero_copy
+                    ? aexrt::run_yolo_ptr(device, model, run_input, run_elements, 16)
+                    : aexrt::run_yolo(device, model, input, max_dets);
                 const auto t1 = std::chrono::high_resolution_clock::now();
                 total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                 const AexrtYoloRunTiming timing = model.last_run_timing();
@@ -164,6 +264,16 @@ int main(int argc, char** argv) {
             }
         }
         std::cout << "AEXRT C++ native graph detections: " << detections.size() << "\n";
+        if (!dump_dets_path.empty()) {
+            std::ofstream df(dump_dets_path, std::ios::binary);
+            const uint32_t n = static_cast<uint32_t>(detections.size());
+            df.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            for (const auto& d : detections) {
+                const float rec[6] = {d.x1, d.y1, d.x2, d.y2, d.score, d.class_id};
+                df.write(reinterpret_cast<const char*>(rec), sizeof(rec));
+            }
+            std::cout << "AEXRT C++ dumped " << n << " detections to " << dump_dets_path << "\n";
+        }
         return 0;
     }
 

@@ -1,0 +1,175 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M conv pair: POSITION-MAJOR, 1x2 output tile x 8 OC.
+ *
+ * Two horizontally adjacent pixels per invocation. Weight fetches are shared
+ * by both positions (2x reuse) while the accumulator footprint stays at 16
+ * floats - unlike the 2x2x8 quartet, which spills registers on Mali. The
+ * 16-channel groups use fp16 dot4 (packed HFMA2) and accumulate into fp32.
+ * Requires ic % 4 == 0 and 4-element aligned placement.
+ */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { f16vec4 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf  { f16vec4 w4[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf  { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf{ f16vec4 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS   { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS    { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS { float16_t o_s[]; };
+
+float16_t dot16(f16vec4 v0, f16vec4 v1, f16vec4 v2, f16vec4 v3,
+                f16vec4 w0, f16vec4 w1, f16vec4 w2, f16vec4 w3) {
+    return dot(v0, w0) + dot(v1, w1) + dot(v2, w2) + dot(v3, w3);
+}
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+} pc;
+
+void main() {
+    uint pair_w = (pc.out_w + 1u) / 2u;
+    uint spatial = pc.out_h * pair_w;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * spatial;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint oy = pos / pair_w;
+    uint ox0 = (pos - oy * pair_w) * 2u;
+    uint oc0 = oc8_idx * 8u;
+    bool has1 = (ox0 + 1u < pc.out_w);
+
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
+    float b0 = 0.0, b1 = 0.0, b2 = 0.0, b3 = 0.0;
+    float b4 = 0.0, b5 = 0.0, b6 = 0.0, b7 = 0.0;
+    if (oc0 < pc.out_c)      { a0 = b_data[pc.b_off + oc0]; b0 = a0; }
+    if (oc0 + 1u < pc.out_c) { a1 = b_data[pc.b_off + oc0 + 1u]; b1 = a1; }
+    if (oc0 + 2u < pc.out_c) { a2 = b_data[pc.b_off + oc0 + 2u]; b2 = a2; }
+    if (oc0 + 3u < pc.out_c) { a3 = b_data[pc.b_off + oc0 + 3u]; b3 = a3; }
+    if (oc0 + 4u < pc.out_c) { a4 = b_data[pc.b_off + oc0 + 4u]; b4 = a4; }
+    if (oc0 + 5u < pc.out_c) { a5 = b_data[pc.b_off + oc0 + 5u]; b5 = a5; }
+    if (oc0 + 6u < pc.out_c) { a6 = b_data[pc.b_off + oc0 + 6u]; b6 = a6; }
+    if (oc0 + 7u < pc.out_c) { a7 = b_data[pc.b_off + oc0 + 7u]; b7 = a7; }
+
+    uint C = pc.in_c;
+    uint C4 = C >> 2;
+    uint R = C * pc.kh * pc.kw;
+    uint row_v4 = ((R + 3u) & ~3u) >> 2;
+    uint wbase = pc.w_off + oc0 * row_v4;
+    uint groups = C4 >> 2;
+    uint vx = (pc.sw * pc.in_ctot) >> 2;
+    uint vy = (pc.sh * pc.in_w * pc.in_ctot) >> 2;
+
+    for (uint kk = 0u; kk < pc.kh * pc.kw; ++kk) {
+        uint ky = kk / pc.kw;
+        uint kx = kk - ky * pc.kw;
+        int iy = int(oy * pc.sh + ky) - int(pc.ph);
+        int ix = int(ox0 * pc.sw + kx) - int(pc.pw);
+        if (iy < 0 || iy >= int(pc.in_h)) continue;
+        bool p0 = (ix >= 0) && (ix < int(pc.in_w));
+        bool p1 = has1 && (ix + int(pc.sw) >= 0) && (ix + int(pc.sw) < int(pc.in_w));
+        if (!p0 && !p1) continue;
+        uint b0i = ((uint(iy) * pc.in_w + uint(clamp(ix, 0, int(pc.in_w) - 1)))
+                    * pc.in_ctot + pc.in_off) >> 2;
+        uint b1i = ((uint(iy) * pc.in_w + uint(clamp(ix + int(pc.sw), 0, int(pc.in_w) - 1)))
+                    * pc.in_ctot + pc.in_off) >> 2;
+        uint wrow = wbase + kk * C4;
+
+        for (uint g = 0u; g < groups; ++g) {
+            uint o = g * 4u;
+            f16vec4 v0 = in4[b0i + o + 0u], v1 = in4[b0i + o + 1u];
+            f16vec4 v2 = in4[b0i + o + 2u], v3 = in4[b0i + o + 3u];
+            f16vec4 u0 = in4[b1i + o + 0u], u1 = in4[b1i + o + 1u];
+            f16vec4 u2 = in4[b1i + o + 2u], u3 = in4[b1i + o + 3u];
+            uint q0 = wrow + o;
+            uint q1 = q0 + row_v4, q2 = q1 + row_v4, q3 = q2 + row_v4;
+            uint q4 = q3 + row_v4, q5 = q4 + row_v4, q6 = q5 + row_v4, q7 = q6 + row_v4;
+            f16vec4 w0 = w4[q0], w1 = w4[q0 + 1u], w2 = w4[q0 + 2u], w3 = w4[q0 + 3u];
+            if (p0) a0 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b0 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q1]; w1 = w4[q1 + 1u]; w2 = w4[q1 + 2u]; w3 = w4[q1 + 3u];
+            if (p0) a1 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b1 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q2]; w1 = w4[q2 + 1u]; w2 = w4[q2 + 2u]; w3 = w4[q2 + 3u];
+            if (p0) a2 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b2 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q3]; w1 = w4[q3 + 1u]; w2 = w4[q3 + 2u]; w3 = w4[q3 + 3u];
+            if (p0) a3 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b3 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q4]; w1 = w4[q4 + 1u]; w2 = w4[q4 + 2u]; w3 = w4[q4 + 3u];
+            if (p0) a4 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b4 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q5]; w1 = w4[q5 + 1u]; w2 = w4[q5 + 2u]; w3 = w4[q5 + 3u];
+            if (p0) a5 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b5 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q6]; w1 = w4[q6 + 1u]; w2 = w4[q6 + 2u]; w3 = w4[q6 + 3u];
+            if (p0) a6 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b6 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+            w0 = w4[q7]; w1 = w4[q7 + 1u]; w2 = w4[q7 + 2u]; w3 = w4[q7 + 3u];
+            if (p0) a7 += float(dot16(v0, v1, v2, v3, w0, w1, w2, w3));
+            if (p1) b7 += float(dot16(u0, u1, u2, u3, w0, w1, w2, w3));
+        }
+        for (uint o = groups * 4u; o < C4; ++o) {   /* 4..12 channel tail */
+            f16vec4 v = in4[b0i + o], u = in4[b1i + o];
+            for (uint ln = 0u; ln < 8u; ++ln) {
+                f16vec4 w = w4[wrow + o + ln * row_v4];
+                float fa = float(dot(v, w)), fb = float(dot(u, w));
+                if (ln == 0u) { if (p0) a0 += fa; if (p1) b0 += fb; }
+                else if (ln == 1u) { if (p0) a1 += fa; if (p1) b1 += fb; }
+                else if (ln == 2u) { if (p0) a2 += fa; if (p1) b2 += fb; }
+                else if (ln == 3u) { if (p0) a3 += fa; if (p1) b3 += fb; }
+                else if (ln == 4u) { if (p0) a4 += fa; if (p1) b4 += fb; }
+                else if (ln == 5u) { if (p0) a5 += fa; if (p1) b5 += fb; }
+                else if (ln == 6u) { if (p0) a6 += fa; if (p1) b6 += fb; }
+                else { if (p0) a7 += fa; if (p1) b7 += fb; }
+            }
+        }
+    }
+
+    if (pc.silu == 1u) {
+        a0 = a0 / (1.0 + exp(-a0)); b0 = b0 / (1.0 + exp(-b0));
+        a1 = a1 / (1.0 + exp(-a1)); b1 = b1 / (1.0 + exp(-b1));
+        a2 = a2 / (1.0 + exp(-a2)); b2 = b2 / (1.0 + exp(-b2));
+        a3 = a3 / (1.0 + exp(-a3)); b3 = b3 / (1.0 + exp(-b3));
+        a4 = a4 / (1.0 + exp(-a4)); b4 = b4 / (1.0 + exp(-b4));
+        a5 = a5 / (1.0 + exp(-a5)); b5 = b5 / (1.0 + exp(-b5));
+        a6 = a6 / (1.0 + exp(-a6)); b6 = b6 / (1.0 + exp(-b6));
+        a7 = a7 / (1.0 + exp(-a7)); b7 = b7 / (1.0 + exp(-b7));
+    } else if (pc.silu == 2u) {
+        a0 = 1.0 / (1.0 + exp(-a0)); b0 = 1.0 / (1.0 + exp(-b0));
+        a1 = 1.0 / (1.0 + exp(-a1)); b1 = 1.0 / (1.0 + exp(-b1));
+        a2 = 1.0 / (1.0 + exp(-a2)); b2 = 1.0 / (1.0 + exp(-b2));
+        a3 = 1.0 / (1.0 + exp(-a3)); b3 = 1.0 / (1.0 + exp(-b3));
+        a4 = 1.0 / (1.0 + exp(-a4)); b4 = 1.0 / (1.0 + exp(-b4));
+        a5 = 1.0 / (1.0 + exp(-a5)); b5 = 1.0 / (1.0 + exp(-b5));
+        a6 = 1.0 / (1.0 + exp(-a6)); b6 = 1.0 / (1.0 + exp(-b6));
+        a7 = 1.0 / (1.0 + exp(-a7)); b7 = 1.0 / (1.0 + exp(-b7));
+    }
+
+    uint p00 = (oy * pc.out_w + ox0) * pc.out_ctot + pc.out_off + oc0;
+    if (oc0 + 8u <= pc.out_c && (pc.out_ctot & 3u) == 0u && (pc.out_off & 3u) == 0u) {
+        out4[p00 >> 2]        = f16vec4(vec4(a0, a1, a2, a3));
+        out4[(p00 + 4u) >> 2] = f16vec4(vec4(a4, a5, a6, a7));
+        if (has1) {
+            out4[(p00 + pc.out_ctot) >> 2]        = f16vec4(vec4(b0, b1, b2, b3));
+            out4[(p00 + pc.out_ctot + 4u) >> 2]   = f16vec4(vec4(b4, b5, b6, b7));
+        }
+    } else {
+        float av[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+        float bv[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
+        for (uint ln = 0u; ln < 8u; ++ln) {
+            if (oc0 + ln >= pc.out_c) break;
+            o_s[p00 + ln] = float16_t(av[ln]);
+            if (has1) o_s[p00 + pc.out_ctot + ln] = float16_t(bv[ln]);
+        }
+    }
+}

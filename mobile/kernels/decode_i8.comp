@@ -1,0 +1,65 @@
+#version 460
+/* AEXRT-M GPU detect-head decode for W8A8 activations.
+ * box/cls are int8 buffers with per-value activation scales; the DFL softmax
+ * is scale-invariant, the class sigmoid and distances are dequantized here.
+ * Candidates are bounded by max_cand. */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer BoxBuf { uint bx[]; };
+layout(set = 0, binding = 1) readonly buffer ClsBuf { uint cl[]; };
+layout(set = 0, binding = 2) writeonly buffer Cand   { float cand[]; };
+layout(set = 0, binding = 3) buffer Cnt { uint cnt; };
+layout(push_constant) uniform PC {
+    uint anchors; uint gw; uint gh; uint input_size;
+    uint nc; uint conf_milli;
+    uint b_off; uint c_off; uint b_ctot; uint c_ctot;
+    uint max_cand;
+    uint b_scale_bits; uint c_scale_bits;
+} pc;
+
+int s8(uint v, uint shift) {
+    int x = int((v >> shift) & 255u);
+    return x >= 128 ? x - 256 : x;
+}
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.anchors) return;
+    float b_scale = uintBitsToFloat(pc.b_scale_bits);
+    float c_scale = uintBitsToFloat(pc.c_scale_bits);
+
+    float best = 0.0; uint bc = 0u;
+    for (uint c = 0u; c < pc.nc; ++c) {
+        int idx = int(i * pc.c_ctot + pc.c_off + c);
+        float raw = float(s8(cl[idx >> 2], uint(idx & 3) * 8u));
+        float s = 1.0 / (1.0 + exp(-raw * c_scale));
+        if (s > best) { best = s; bc = c; }
+    }
+    if (best * 1000.0 < float(pc.conf_milli)) return;
+
+    float d[4];
+    for (uint side = 0u; side < 4u; ++side) {
+        int p = int(i * pc.b_ctot + pc.b_off + side * 16u);
+        float mx = -1e30f;
+        for (uint k = 0u; k < 16u; ++k) {
+            int idx = p + int(k);
+            float v = float(s8(bx[idx >> 2], uint(idx & 3) * 8u)) * b_scale;
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0, acc = 0.0;
+        for (uint k = 0u; k < 16u; ++k) {
+            int idx = p + int(k);
+            float e = exp(float(s8(bx[idx >> 2], uint(idx & 3) * 8u)) * b_scale - mx);
+            sum += e; acc += e * float(k);
+        }
+        d[side] = acc / sum;
+    }
+    float gx = float(i % pc.gw) + 0.5, gy = float(i / pc.gw) + 0.5;
+    float st = float(pc.input_size) / float(pc.gw);
+    uint slot = atomicAdd(cnt, 1u);
+    if (slot >= pc.max_cand) return;
+    cand[slot * 6u + 0u] = (gx - d[0]) * st;
+    cand[slot * 6u + 1u] = (gy - d[1]) * st;
+    cand[slot * 6u + 2u] = (gx + d[2]) * st;
+    cand[slot * 6u + 3u] = (gy + d[3]) * st;
+    cand[slot * 6u + 4u] = best;
+    cand[slot * 6u + 5u] = float(bc);
+}

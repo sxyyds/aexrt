@@ -1,0 +1,131 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M conv, POSITION-MAJOR + symmetric f16vec4 vectorization.
+ * Activations: value[pos*C + ch]; weights: [oc][kk][ic] fp16 (ic contiguous).
+ * Per (tap, 4 channels): ONE f16vec4 input load + ONE f16vec4 weight load
+ * per OC lane + one dot4 — no unpack, no scales, fp32 accumulate.
+ * Output: 8 OC lanes at one position = 8 consecutive fp16 = 2 vec stores.
+ * Stem (C=3) uses the scalar view (binding 5). */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf   { f16vec4 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf    { f16vec4 w4[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf    { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { f16vec4 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS     { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS      { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS   { float16_t o_s[]; };
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off;     /* weights, f16vec4-unit offset (bytes/8) */
+    uint b_off;     /* bias, float-element offset */
+    uint in_off;    /* input channel offset (slice view) */
+    uint out_off;   /* output channel offset (concat placement) */
+    uint out_ctot;  /* output buffer's total channels */
+    uint in_ctot;   /* input buffer's total channels */
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint spatial = pc.out_h * pc.out_w;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * spatial;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint oh = pos / pc.out_w;
+    uint ow = pos - oh * pc.out_w;
+    uint oc0 = oc8_idx * 8u;
+
+    uint k_elems = pc.kh * pc.kw;
+    uint C = pc.in_c;
+    uint R = C * k_elems;
+    uint Rp = (R + 3u) & ~3u;             /* fp16 elements per OC weight row */
+    uint row_v4 = Rp >> 2;                /* f16vec4s per OC row */
+    /* f16vec4 loads/stores need 4-element-aligned base strides and offsets;
+     * concat/slice placement can produce arbitrary channel offsets. */
+    bool vec_ok = (C & 3u) == 0u && (pc.in_ctot & 3u) == 0u && (pc.in_off & 3u) == 0u
+               && (pc.out_ctot & 3u) == 0u && (pc.out_off & 3u) == 0u;
+
+    vec4 accA = vec4(0.0), accB = vec4(0.0);
+    if (oc0 < pc.out_c)        accA.x = b_data[pc.b_off + oc0];
+    if (oc0 + 1u < pc.out_c)   accA.y = b_data[pc.b_off + oc0 + 1u];
+    if (oc0 + 2u < pc.out_c)   accA.z = b_data[pc.b_off + oc0 + 2u];
+    if (oc0 + 3u < pc.out_c)   accA.w = b_data[pc.b_off + oc0 + 3u];
+    if (oc0 + 4u < pc.out_c)   accB.x = b_data[pc.b_off + oc0 + 4u];
+    if (oc0 + 5u < pc.out_c)   accB.y = b_data[pc.b_off + oc0 + 5u];
+    if (oc0 + 6u < pc.out_c)   accB.z = b_data[pc.b_off + oc0 + 6u];
+    if (oc0 + 7u < pc.out_c)   accB.w = b_data[pc.b_off + oc0 + 7u];
+
+    if (vec_ok) {
+        uint wbase = pc.w_off + oc0 * row_v4;
+        for (uint kk = 0u; kk < k_elems; ++kk) {
+            uint ky = kk / pc.kw;
+            uint kx = kk - ky * pc.kw;
+            int ih = int(oh * pc.sh + ky) - int(pc.ph);
+            int iw = int(ow * pc.sw + kx) - int(pc.pw);
+            if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+            uint bin = (uint(ih) * pc.in_w + uint(iw)) * pc.in_ctot + pc.in_off;
+            uint wk = wbase + kk * (C >> 2);
+            for (uint ic = 0u; ic < C; ic += 4u) {
+                vec4 v = vec4(in4[(bin + ic) >> 2]);
+                accA.x += dot(v, vec4(w4[wk + (ic >> 2)]));
+                accA.y += dot(v, vec4(w4[wk + (ic >> 2) + row_v4]));
+                accA.z += dot(v, vec4(w4[wk + (ic >> 2) + 2u * row_v4]));
+                accA.w += dot(v, vec4(w4[wk + (ic >> 2) + 3u * row_v4]));
+                accB.x += dot(v, vec4(w4[wk + (ic >> 2) + 4u * row_v4]));
+                accB.y += dot(v, vec4(w4[wk + (ic >> 2) + 5u * row_v4]));
+                accB.z += dot(v, vec4(w4[wk + (ic >> 2) + 6u * row_v4]));
+                accB.w += dot(v, vec4(w4[wk + (ic >> 2) + 7u * row_v4]));
+            }
+        }
+    } else {
+        /* scalar fallback: C not multiple of 4 (stem C=3) */
+        uint wbase_h = pc.w_off * 4u;      /* bytes/8 -> fp16 elements: *4 */
+        /* C<4 rows are padded to 4 channels per tap by the exporter. */
+        uint Cpad = (C < 4u) ? 4u : C;
+        uint Rp_s = (Cpad * pc.kh * pc.kw + 3u) & ~3u;
+        for (uint kk = 0u; kk < k_elems; ++kk) {
+            uint ky = kk / pc.kw;
+            uint kx = kk - ky * pc.kw;
+            int ih = int(oh * pc.sh + ky) - int(pc.ph);
+            int iw = int(ow * pc.sw + kx) - int(pc.pw);
+            if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+            uint base_in = (uint(ih) * pc.in_w + uint(iw)) * pc.in_ctot + pc.in_off;
+            for (uint ic = 0u; ic < C; ++ic) {
+                float v = float(in_s[base_in + ic]);
+                uint f = kk * Cpad + ic;
+                for (uint ln = 0u; ln < 8u; ++ln) {
+                    if (oc0 + ln >= pc.out_c) break;
+                    float wv = float(w_s[wbase_h + (oc0 + ln) * Rp_s + f]);
+                    float a = (ln < 4u ? accA[ln & 3u] : accB[ln & 3u]);
+                    a += v * wv;
+                    if (ln < 4u) accA[ln & 3u] = a; else accB[ln & 3u] = a;
+                }
+            }
+        }
+    }
+    if (pc.silu == 1u) {
+        accA = accA / (vec4(1.0) + exp(-accA));
+        accB = accB / (vec4(1.0) + exp(-accB));
+    } else if (pc.silu == 2u) {
+        accA = vec4(1.0) / (vec4(1.0) + exp(-accA));
+        accB = vec4(1.0) / (vec4(1.0) + exp(-accB));
+    }
+    uint obase = pos * pc.out_ctot + pc.out_off + oc0;
+    if (vec_ok) {
+        if (oc0 + 4u <= pc.out_c)  out4[obase >> 2] = f16vec4(accA);
+        if (oc0 + 8u <= pc.out_c)  out4[(obase + 4u) >> 2] = f16vec4(accB);
+    } else {
+        for (uint ln = 0u; ln < 8u; ++ln) {
+            if (oc0 + ln >= pc.out_c) break;
+            float v = ln < 4u ? accA[ln & 3u] : accB[ln & 3u];
+            o_s[obase + ln] = float16_t(v);
+        }
+    }
+}

@@ -1,0 +1,218 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M conv v2: POSITION-MAJOR, 2x2 output tile x 8 output channels.
+ *
+ * One invocation computes 4 output pixels and 8 OC. Per 4-channel group it
+ * loads 4 input f16vec4 (one per tile position) and 8 weight f16vec4, then
+ * issues 32 fp16 dot4s (128 MACs): weights are reused 4x and the overlapping
+ * 3x3 windows are reused across the tile, cutting global weight traffic ~4x
+ * versus the 1-pixel kernel. Multiplications and the 4-wide dot stay in fp16
+ * (packed HFMA2); the per-group result is accumulated into fp32 lanes.
+ *
+ * Interior tiles take the branch-free path; border/odd tiles use clamped
+ * loads with per-position validity. Requires ic % 4 == 0 and 4-element
+ * aligned placement.
+ */
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { f16vec4 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf  { f16vec4 w4[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf  { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf{ f16vec4 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS   { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS    { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS { float16_t o_s[]; };
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+} pc;
+
+void main() {
+    uint tile_w = (pc.out_w + 1u) / 2u;
+    uint tile_h = (pc.out_h + 1u) / 2u;
+    uint tiles = tile_w * tile_h;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * tiles;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= total) return;
+
+    uint tile = idx % tiles;
+    uint t = idx / tiles;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint ty = tile / tile_w;
+    uint tx = tile - ty * tile_w;
+    uint oh0 = ty * 2u, ow0 = tx * 2u;
+    uint oc0 = oc8_idx * 8u;
+
+    /* bias per lane, broadcast over the four output positions */
+    vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+    vec4 a4 = vec4(0.0), a5 = vec4(0.0), a6 = vec4(0.0), a7 = vec4(0.0);
+    if (oc0 < pc.out_c)      a0 = vec4(b_data[pc.b_off + oc0]);
+    if (oc0 + 1u < pc.out_c) a1 = vec4(b_data[pc.b_off + oc0 + 1u]);
+    if (oc0 + 2u < pc.out_c) a2 = vec4(b_data[pc.b_off + oc0 + 2u]);
+    if (oc0 + 3u < pc.out_c) a3 = vec4(b_data[pc.b_off + oc0 + 3u]);
+    if (oc0 + 4u < pc.out_c) a4 = vec4(b_data[pc.b_off + oc0 + 4u]);
+    if (oc0 + 5u < pc.out_c) a5 = vec4(b_data[pc.b_off + oc0 + 5u]);
+    if (oc0 + 6u < pc.out_c) a6 = vec4(b_data[pc.b_off + oc0 + 6u]);
+    if (oc0 + 7u < pc.out_c) a7 = vec4(b_data[pc.b_off + oc0 + 7u]);
+
+    uint C4 = pc.in_c >> 2;
+    uint row_v4 = ((pc.in_c * pc.kh * pc.kw + 3u) & ~3u) >> 2;
+    uint wbase = pc.w_off + oc0 * row_v4;
+    /* input offset between the two tile columns / rows, in f16vec4 units */
+    uint vx = (pc.sw * pc.in_ctot) >> 2;
+    uint vy = (pc.sh * pc.in_w * pc.in_ctot) >> 2;
+
+    bool interior = (oh0 + 1u < pc.out_h) && (ow0 + 1u < pc.out_w) &&
+        (int(oh0 * pc.sh) - int(pc.ph) >= 0) &&
+        (int((oh0 + 1u) * pc.sh) + int(pc.kh) - 1 - int(pc.ph) < int(pc.in_h)) &&
+        (int(ow0 * pc.sw) - int(pc.pw) >= 0) &&
+        (int((ow0 + 1u) * pc.sw) + int(pc.kw) - 1 - int(pc.pw) < int(pc.in_w));
+
+    for (uint kk = 0u; kk < pc.kh * pc.kw; ++kk) {
+        uint ky = kk / pc.kw, kx = kk - ky * pc.kw;
+        int iy0 = int(oh0 * pc.sh + ky) - int(pc.ph);
+        int ix0 = int(ow0 * pc.sw + kx) - int(pc.pw);
+        uint wrow = wbase + kk * C4;
+
+        if (interior) {
+            uint i00 = ((uint(iy0) * pc.in_w + uint(ix0)) * pc.in_ctot + pc.in_off) >> 2;
+            for (uint ic = 0u; ic < C4; ++ic) {
+                f16vec4 v00 = in4[i00 + ic];
+                f16vec4 v01 = in4[i00 + vx + ic];
+                f16vec4 v10 = in4[i00 + vy + ic];
+                f16vec4 v11 = in4[i00 + vx + vy + ic];
+                f16vec4 w0 = w4[wrow + ic];
+                f16vec4 w1 = w4[wrow + ic + row_v4];
+                f16vec4 w2 = w4[wrow + ic + 2u * row_v4];
+                f16vec4 w3 = w4[wrow + ic + 3u * row_v4];
+                f16vec4 w4v = w4[wrow + ic + 4u * row_v4];
+                f16vec4 w5 = w4[wrow + ic + 5u * row_v4];
+                f16vec4 w6 = w4[wrow + ic + 6u * row_v4];
+                f16vec4 w7 = w4[wrow + ic + 7u * row_v4];
+                a0 += vec4(float(dot(v00, w0)), float(dot(v01, w0)),
+                           float(dot(v10, w0)), float(dot(v11, w0)));
+                a1 += vec4(float(dot(v00, w1)), float(dot(v01, w1)),
+                           float(dot(v10, w1)), float(dot(v11, w1)));
+                a2 += vec4(float(dot(v00, w2)), float(dot(v01, w2)),
+                           float(dot(v10, w2)), float(dot(v11, w2)));
+                a3 += vec4(float(dot(v00, w3)), float(dot(v01, w3)),
+                           float(dot(v10, w3)), float(dot(v11, w3)));
+                a4 += vec4(float(dot(v00, w4v)), float(dot(v01, w4v)),
+                           float(dot(v10, w4v)), float(dot(v11, w4v)));
+                a5 += vec4(float(dot(v00, w5)), float(dot(v01, w5)),
+                           float(dot(v10, w5)), float(dot(v11, w5)));
+                a6 += vec4(float(dot(v00, w6)), float(dot(v01, w6)),
+                           float(dot(v10, w6)), float(dot(v11, w6)));
+                a7 += vec4(float(dot(v00, w7)), float(dot(v01, w7)),
+                           float(dot(v10, w7)), float(dot(v11, w7)));
+            }
+        } else {
+            bool p0 = (oh0 < pc.out_h) && (ow0 < pc.out_w) &&
+                      (iy0 >= 0) && (iy0 < int(pc.in_h)) && (ix0 >= 0) && (ix0 < int(pc.in_w));
+            bool p1 = (oh0 < pc.out_h) && (ow0 + 1u < pc.out_w) &&
+                      (iy0 >= 0) && (iy0 < int(pc.in_h)) &&
+                      (ix0 + int(pc.sw) >= 0) && (ix0 + int(pc.sw) < int(pc.in_w));
+            bool p2 = (oh0 + 1u < pc.out_h) && (ow0 < pc.out_w) &&
+                      (iy0 + int(pc.sh) >= 0) && (iy0 + int(pc.sh) < int(pc.in_h)) &&
+                      (ix0 >= 0) && (ix0 < int(pc.in_w));
+            bool p3 = (oh0 + 1u < pc.out_h) && (ow0 + 1u < pc.out_w) &&
+                      (iy0 + int(pc.sh) >= 0) && (iy0 + int(pc.sh) < int(pc.in_h)) &&
+                      (ix0 + int(pc.sw) >= 0) && (ix0 + int(pc.sw) < int(pc.in_w));
+            uint b00 = ((uint(clamp(iy0, 0, int(pc.in_h) - 1)) * pc.in_w +
+                         uint(clamp(ix0, 0, int(pc.in_w) - 1))) * pc.in_ctot + pc.in_off) >> 2;
+            uint b01 = ((uint(clamp(iy0, 0, int(pc.in_h) - 1)) * pc.in_w +
+                         uint(clamp(ix0 + int(pc.sw), 0, int(pc.in_w) - 1))) * pc.in_ctot + pc.in_off) >> 2;
+            uint b10 = ((uint(clamp(iy0 + int(pc.sh), 0, int(pc.in_h) - 1)) * pc.in_w +
+                         uint(clamp(ix0, 0, int(pc.in_w) - 1))) * pc.in_ctot + pc.in_off) >> 2;
+            uint b11 = ((uint(clamp(iy0 + int(pc.sh), 0, int(pc.in_h) - 1)) * pc.in_w +
+                         uint(clamp(ix0 + int(pc.sw), 0, int(pc.in_w) - 1))) * pc.in_ctot + pc.in_off) >> 2;
+            for (uint ic = 0u; ic < C4; ++ic) {
+                f16vec4 v00 = p0 ? in4[b00 + ic] : f16vec4(0.0);
+                f16vec4 v01 = p1 ? in4[b01 + ic] : f16vec4(0.0);
+                f16vec4 v10 = p2 ? in4[b10 + ic] : f16vec4(0.0);
+                f16vec4 v11 = p3 ? in4[b11 + ic] : f16vec4(0.0);
+                f16vec4 w0 = w4[wrow + ic];
+                f16vec4 w1 = w4[wrow + ic + row_v4];
+                f16vec4 w2 = w4[wrow + ic + 2u * row_v4];
+                f16vec4 w3 = w4[wrow + ic + 3u * row_v4];
+                f16vec4 w4v = w4[wrow + ic + 4u * row_v4];
+                f16vec4 w5 = w4[wrow + ic + 5u * row_v4];
+                f16vec4 w6 = w4[wrow + ic + 6u * row_v4];
+                f16vec4 w7 = w4[wrow + ic + 7u * row_v4];
+                a0 += vec4(float(dot(v00, w0)), float(dot(v01, w0)),
+                           float(dot(v10, w0)), float(dot(v11, w0)));
+                a1 += vec4(float(dot(v00, w1)), float(dot(v01, w1)),
+                           float(dot(v10, w1)), float(dot(v11, w1)));
+                a2 += vec4(float(dot(v00, w2)), float(dot(v01, w2)),
+                           float(dot(v10, w2)), float(dot(v11, w2)));
+                a3 += vec4(float(dot(v00, w3)), float(dot(v01, w3)),
+                           float(dot(v10, w3)), float(dot(v11, w3)));
+                a4 += vec4(float(dot(v00, w4v)), float(dot(v01, w4v)),
+                           float(dot(v10, w4v)), float(dot(v11, w4v)));
+                a5 += vec4(float(dot(v00, w5)), float(dot(v01, w5)),
+                           float(dot(v10, w5)), float(dot(v11, w5)));
+                a6 += vec4(float(dot(v00, w6)), float(dot(v01, w6)),
+                           float(dot(v10, w6)), float(dot(v11, w6)));
+                a7 += vec4(float(dot(v00, w7)), float(dot(v01, w7)),
+                           float(dot(v10, w7)), float(dot(v11, w7)));
+            }
+        }
+    }
+
+    if (pc.silu == 1u) {
+        a0 = a0 / (vec4(1.0) + exp(-a0)); a1 = a1 / (vec4(1.0) + exp(-a1));
+        a2 = a2 / (vec4(1.0) + exp(-a2)); a3 = a3 / (vec4(1.0) + exp(-a3));
+        a4 = a4 / (vec4(1.0) + exp(-a4)); a5 = a5 / (vec4(1.0) + exp(-a5));
+        a6 = a6 / (vec4(1.0) + exp(-a6)); a7 = a7 / (vec4(1.0) + exp(-a7));
+    } else if (pc.silu == 2u) {
+        a0 = vec4(1.0) / (vec4(1.0) + exp(-a0)); a1 = vec4(1.0) / (vec4(1.0) + exp(-a1));
+        a2 = vec4(1.0) / (vec4(1.0) + exp(-a2)); a3 = vec4(1.0) / (vec4(1.0) + exp(-a3));
+        a4 = vec4(1.0) / (vec4(1.0) + exp(-a4)); a5 = vec4(1.0) / (vec4(1.0) + exp(-a5));
+        a6 = vec4(1.0) / (vec4(1.0) + exp(-a6)); a7 = vec4(1.0) / (vec4(1.0) + exp(-a7));
+    }
+
+    /* aX[p] holds lane X at tile position p; output wants [pos][OC] */
+    if (oc0 + 8u <= pc.out_c) {
+        uint p00 = (oh0 * pc.out_w + ow0) * pc.out_ctot + pc.out_off + oc0;
+        out4[p00 >> 2]         = f16vec4(vec4(a0.x, a1.x, a2.x, a3.x));
+        out4[(p00 + 4u) >> 2]  = f16vec4(vec4(a4.x, a5.x, a6.x, a7.x));
+        if (ow0 + 1u < pc.out_w) {
+            out4[(p00 + pc.out_ctot) >> 2] =
+                f16vec4(vec4(a0.y, a1.y, a2.y, a3.y));
+            out4[(p00 + pc.out_ctot + 4u) >> 2] =
+                f16vec4(vec4(a4.y, a5.y, a6.y, a7.y));
+        }
+        if (oh0 + 1u < pc.out_h) {
+            uint p10 = p00 + pc.out_w * pc.out_ctot;
+            out4[p10 >> 2] = f16vec4(vec4(a0.z, a1.z, a2.z, a3.z));
+            out4[(p10 + 4u) >> 2] = f16vec4(vec4(a4.z, a5.z, a6.z, a7.z));
+            if (ow0 + 1u < pc.out_w) {
+                out4[(p10 + pc.out_ctot) >> 2] =
+                    f16vec4(vec4(a0.w, a1.w, a2.w, a3.w));
+                out4[(p10 + pc.out_ctot + 4u) >> 2] =
+                    f16vec4(vec4(a4.w, a5.w, a6.w, a7.w));
+            }
+        }
+    } else {
+        for (uint ln = 0u; ln < 8u; ++ln) {
+            if (oc0 + ln >= pc.out_c) break;
+            vec4 av = ln == 0u ? a0 : ln == 1u ? a1 : ln == 2u ? a2 : ln == 3u ? a3 :
+                      ln == 4u ? a4 : ln == 5u ? a5 : ln == 6u ? a6 : a7;
+            if (oh0 < pc.out_h && ow0 < pc.out_w)
+                o_s[(oh0 * pc.out_w + ow0) * pc.out_ctot + pc.out_off + oc0 + ln] = float16_t(av.x);
+            if (ow0 + 1u < pc.out_w)
+                o_s[(oh0 * pc.out_w + ow0 + 1u) * pc.out_ctot + pc.out_off + oc0 + ln] = float16_t(av.y);
+            if (oh0 + 1u < pc.out_h) {
+                o_s[((oh0 + 1u) * pc.out_w + ow0) * pc.out_ctot + pc.out_off + oc0 + ln] = float16_t(av.z);
+                if (ow0 + 1u < pc.out_w)
+                    o_s[((oh0 + 1u) * pc.out_w + ow0 + 1u) * pc.out_ctot + pc.out_off + oc0 + ln] = float16_t(av.w);
+            }
+        }
+    }
+}

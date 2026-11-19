@@ -1,0 +1,56 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M GPU detect-head decode (YOLOv8 DFL head), POSITION-MAJOR.
+ * box[pos*b_ctot + b_off + side*16 + k], cls[pos*c_ctot + c_off + c].
+ * Per anchor: sigmoid class scores, DFL expectation, box decode, atomic
+ * compaction into a bounded candidate buffer. CPU then runs sort+NMS. */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer BoxBuf { float16_t bx[]; };
+layout(set = 0, binding = 1) readonly buffer ClsBuf { float16_t cl[]; };
+layout(set = 0, binding = 2) writeonly buffer Cand   { float cand[]; };
+layout(set = 0, binding = 3) buffer Cnt    { uint cnt; };
+layout(push_constant) uniform PC {
+    uint anchors; uint gw; uint gh; uint input_size;
+    uint nc; uint conf_milli;
+    uint b_off; uint c_off; uint b_ctot; uint c_ctot;
+    uint max_cand;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.anchors) return;
+
+    float best = 0.0; uint bc = 0u;
+    for (uint c = 0u; c < pc.nc; ++c) {
+        float s = 1.0 / (1.0 + exp(-float(cl[i * pc.c_ctot + pc.c_off + c])));
+        if (s > best) { best = s; bc = c; }
+    }
+    if (best * 1000.0 < float(pc.conf_milli)) return;
+
+    float d[4];
+    for (uint side = 0u; side < 4u; ++side) {
+        uint p = i * pc.b_ctot + pc.b_off + side * 16u;
+        float mx = -1e30f;
+        for (uint k = 0u; k < 16u; ++k) {
+            float v = float(bx[p + k]);
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0, acc = 0.0;
+        for (uint k = 0u; k < 16u; ++k) {
+            float e = exp(float(bx[p + k]) - mx);
+            sum += e; acc += e * float(k);
+        }
+        d[side] = acc / sum;
+    }
+    float gx = float(i % pc.gw) + 0.5, gy = float(i / pc.gw) + 0.5;
+    float st = float(pc.input_size) / float(pc.gw);
+    uint slot = atomicAdd(cnt, 1u);
+    if (slot >= pc.max_cand) return;   /* bounded: never write past the pool */
+    cand[slot * 6u + 0u] = (gx - d[0]) * st;
+    cand[slot * 6u + 1u] = (gy - d[1]) * st;
+    cand[slot * 6u + 2u] = (gx + d[2]) * st;
+    cand[slot * 6u + 3u] = (gy + d[3]) * st;
+    cand[slot * 6u + 4u] = best;
+    cand[slot * 6u + 5u] = float(bc);
+}

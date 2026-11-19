@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* AEXRT-M stem conv: C < 4 (the 3-channel RGB stem) with f16vec4 weights.
+ *
+ * The generic fallback fetches scalar fp16 weights per (tap, channel, OC
+ * lane) and converts each product to fp32 - for a 3-channel stem that is
+ * 3x the weight instructions of the main kernels and leaves the fp16 dot
+ * units idle.  The exporter pads every tap to 4 channels (3 real + 1 zero),
+ * so one f16vec4 load per (tap, OC lane) and one fp16 dot4 replace the
+ * scalar chain.  Input stays scalar (only 3 values) and is assembled into a
+ * f16vec4 with a zero lane.
+ */
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InBuf { f16vec4 in4[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf  { f16vec4 w4[]; };
+layout(set = 0, binding = 2) readonly buffer BBuf  { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf{ f16vec4 out4[]; };
+layout(set = 0, binding = 4) readonly buffer InS   { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS    { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutS { float16_t o_s[]; };
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint spatial = pc.out_h * pc.out_w;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * spatial;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint oh = pos / pc.out_w;
+    uint ow = pos - oh * pc.out_w;
+    uint oc0 = oc8_idx * 8u;
+
+    vec4 accA = vec4(0.0), accB = vec4(0.0);
+    if (oc0 < pc.out_c)      accA.x = b_data[pc.b_off + oc0];
+    if (oc0 + 1u < pc.out_c) accA.y = b_data[pc.b_off + oc0 + 1u];
+    if (oc0 + 2u < pc.out_c) accA.z = b_data[pc.b_off + oc0 + 2u];
+    if (oc0 + 3u < pc.out_c) accA.w = b_data[pc.b_off + oc0 + 3u];
+    if (oc0 + 4u < pc.out_c) accB.x = b_data[pc.b_off + oc0 + 4u];
+    if (oc0 + 5u < pc.out_c) accB.y = b_data[pc.b_off + oc0 + 5u];
+    if (oc0 + 6u < pc.out_c) accB.z = b_data[pc.b_off + oc0 + 6u];
+    if (oc0 + 7u < pc.out_c) accB.w = b_data[pc.b_off + oc0 + 7u];
+
+    uint k_elems = pc.kh * pc.kw;
+    uint row_v4 = k_elems;              /* exporter pads each tap to 4 halfs */
+    uint wbase = pc.w_off + oc0 * row_v4;
+    uint C = pc.in_c;
+
+    for (uint kk = 0u; kk < k_elems; ++kk) {
+        uint ky = kk / pc.kw;
+        uint kx = kk - ky * pc.kw;
+        int ih = int(oh * pc.sh + ky) - int(pc.ph);
+        int iw = int(ow * pc.sw + kx) - int(pc.pw);
+        if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+        uint base = (uint(ih) * pc.in_w + uint(iw)) * pc.in_ctot + pc.in_off;
+        f16vec4 v = f16vec4(float16_t(0.0));
+        if (C > 0u) v.x = in_s[base];
+        if (C > 1u) v.y = in_s[base + 1u];
+        if (C > 2u) v.z = in_s[base + 2u];
+        /* C==3: v.w stays zero and its weight lane is zero as well. */
+        uint wb = wbase + kk;
+        float d0 = float(dot(v, w4[wb]));
+        float d1 = float(dot(v, w4[wb + row_v4]));
+        float d2 = float(dot(v, w4[wb + 2u * row_v4]));
+        float d3 = float(dot(v, w4[wb + 3u * row_v4]));
+        float d4 = float(dot(v, w4[wb + 4u * row_v4]));
+        float d5 = float(dot(v, w4[wb + 5u * row_v4]));
+        float d6 = float(dot(v, w4[wb + 6u * row_v4]));
+        float d7 = float(dot(v, w4[wb + 7u * row_v4]));
+        accA += vec4(d0, d1, d2, d3);
+        accB += vec4(d4, d5, d6, d7);
+    }
+
+    if (pc.silu == 1u) {
+        accA = accA / (vec4(1.0) + exp(-accA));
+        accB = accB / (vec4(1.0) + exp(-accB));
+    } else if (pc.silu == 2u) {
+        accA = vec4(1.0) / (vec4(1.0) + exp(-accA));
+        accB = vec4(1.0) / (vec4(1.0) + exp(-accB));
+    }
+    uint obase = pos * pc.out_ctot + pc.out_off + oc0;
+    if ((pc.out_ctot & 3u) == 0u && (pc.out_off & 3u) == 0u && oc0 + 8u <= pc.out_c) {
+        out4[obase >> 2] = f16vec4(accA);
+        out4[(obase + 4u) >> 2] = f16vec4(accB);
+    } else {
+        for (uint ln = 0u; ln < 8u; ++ln) {
+            if (oc0 + ln >= pc.out_c) break;
+            float val = ln < 4u ? accA[ln & 3u] : accB[ln & 3u];
+            o_s[obase + ln] = float16_t(val);
+        }
+    }
+}

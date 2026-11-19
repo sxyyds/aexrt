@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <intrin.h>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -139,10 +140,25 @@ struct AexrtDevice {
      * exposure collapse; per-thread 8 int accumulators (register-safe). */
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts_silu_pso;
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts_linear_pso;
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts4_silu_pso;
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts4_linear_pso;
+    /* 2 oc/thread (512 threads, same 32x32 tile): doubles the resident warps
+     * for short-spatial 1x1 layers where total threads cap occupancy. */
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts2o_silu_pso;
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv1x1_lts2o_linear_pso;
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3_lts_silu_pso;
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3_lts_linear_pso;
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_lts_silu_pso;
     ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_lts_linear_pso;
+    /* stride-2 with the weight tile staged in LDS at half-KB (8 icg):
+     * A 4.9KB + B 9.3KB = 14.2KB, still occupancy-friendly. */
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_ltsb_silu_pso;
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_ltsb_linear_pso;
+    /* Short-spatial stride-2 variant: 4 oc/thread, 256 threads/group. The
+     * 8-oc kernel exposes only ~8-13 warps/SM on 10x10/20x20 outputs; halving
+     * the per-thread oc tile doubles resident warps for the same work. */
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_lts4_silu_pso;
+    ComPtr<ID3D12PipelineState> conv_int8_prequant_conv3x3s2_lts4_linear_pso;
     /* Fused amax+pack (pg16): one workgroup per 16ch group computes its own
      * scale in LDS then packs - replaces the zero/amax/park 3-dispatch chain. */
     ComPtr<ID3D12RootSignature> int8_quant_fused_root_signature;
@@ -223,6 +239,8 @@ struct AexrtDevice {
     ComPtr<ID3D12PipelineState> concat_conv1x1_linear_pso;
     ComPtr<ID3D12PipelineState> concat_conv1x1_vec4_silu_pso;
     ComPtr<ID3D12PipelineState> concat_conv1x1_vec4_linear_pso;
+    ComPtr<ID3D12PipelineState> concat_conv1x1_vec4x4_silu_pso;
+    ComPtr<ID3D12PipelineState> concat_conv1x1_vec4x4_linear_pso;
     ComPtr<ID3D12PipelineState> concat_conv1x1_gemm256_silu_pso;
     ComPtr<ID3D12PipelineState> concat_conv1x1_gemm256_linear_pso;
     ComPtr<ID3D12PipelineState> concat_conv1x1_gemm_silu_pso;
@@ -1342,11 +1360,28 @@ static HRESULT signal_and_wait(AexrtDevice* ctx) {
         return hr;
     }
     if (ctx->fence->GetCompletedValue() < value) {
-        hr = ctx->fence->SetEventOnCompletion(value, ctx->fence_event);
-        if (FAILED(hr)) {
-            return hr;
+        /* Optional bounded spin: removes the OS wait-wakeup tail from the
+         * measured frame latency (AEXRT_NATIVE_D3D12_SPIN_FENCE=1).  Falls
+         * back to the event wait after 2 ms so long frames do not burn a core. */
+        static const bool spin_fence = [] {
+            const char* v = std::getenv("AEXRT_NATIVE_D3D12_SPIN_FENCE");
+            return v && *v == '1';
+        }();
+        if (spin_fence) {
+            const auto start = std::chrono::steady_clock::now();
+            while (ctx->fence->GetCompletedValue() < value &&
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start).count() < 2.0) {
+                _mm_pause();
+            }
         }
-        WaitForSingleObject(ctx->fence_event, INFINITE);
+        if (ctx->fence->GetCompletedValue() < value) {
+            hr = ctx->fence->SetEventOnCompletion(value, ctx->fence_event);
+            if (FAILED(hr)) {
+                return hr;
+            }
+            WaitForSingleObject(ctx->fence_event, INFINITE);
+        }
     }
     return S_OK;
 }
@@ -3402,8 +3437,11 @@ cbuffer AexrtConv2DConstants : register(b0) {
 };
 #define AEXRT_TS 32u
 #define AEXRT_KB 32u
-groupshared uint lts_a[AEXRT_TS][AEXRT_KB];
-groupshared uint lts_b[AEXRT_TS][AEXRT_KB];
+/* +1 padding: the compute reads column k across many rows.  A 32-word row
+ * stride maps every row to the same LDS bank (32-way conflict); 33 words
+ * rotates the bank by row and makes the A/B tile reads conflict-free. */
+groupshared uint lts_a[AEXRT_TS][AEXRT_KB + 1u];
+groupshared uint lts_b[AEXRT_TS][AEXRT_KB + 1u];
 [numthreads(128, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
     const uint spatial = out_h * out_w;
@@ -3511,6 +3549,153 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
     return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
 }
 
+/* LDS-tiled int8 1x1 GEMM (pg16 scales), 4-OC/thread variant for short spatial.
+ * Used when out_h*out_w is small: 256 threads/group doubles warp occupancy.
+ *
+ * C[pos, oc] = sum_icg dot4(A[pos, icg], B[oc, icg]) with per-16ch-group
+ * dequant. Group = 32 pos x 32 oc tile (256 threads, 1 pos x 4 oc each);
+ * K staged in blocks of 32 icg through groupshared (A 4KB + B 4KB), so the
+ * B (weight) traffic drops 32x and short grids get real work per group.
+ * Within a K-block, each 4-icg g16 slice accumulates in int then converts
+ * once - 8 int + 8 float accumulators, register-safe. */
+static HRESULT ensure_conv_int8_conv1x1_lts4_pipeline(AexrtDevice* ctx, bool silu) {
+    if (!ctx) return E_INVALIDARG;
+    if (!aexrt_device_supports_int8_dot4(ctx)) return E_NOINTERFACE;
+    ComPtr<ID3D12PipelineState>* target = silu
+        ? std::addressof(ctx->conv_int8_prequant_conv1x1_lts4_silu_pso)
+        : std::addressof(ctx->conv_int8_prequant_conv1x1_lts4_linear_pso);
+    if (ctx->conv_int8_prequant_root_signature && *target) return S_OK;
+    {
+        HRESULT hr = ensure_conv_int8_prequant_pipeline(ctx, 1u, silu, true);
+        if (FAILED(hr)) return hr;
+    }
+    const char* src = R"(
+StructuredBuffer<uint> aexrt_input_q : register(t0);
+StructuredBuffer<uint> aexrt_weight : register(t1);
+StructuredBuffer<float> aexrt_scale : register(t2);
+StructuredBuffer<float> aexrt_bias : register(t3);
+StructuredBuffer<uint> aexrt_amax : register(t4);
+RWBuffer<float> aexrt_output : register(u0);
+cbuffer AexrtConv2DConstants : register(b0) {
+    uint batch; uint in_channels; uint in_h; uint in_w;
+    uint out_channels; uint out_h; uint out_w;
+    uint kernel_h; uint kernel_w; uint stride_h; uint stride_w;
+    uint pad_top; uint pad_left; uint dilation_h; uint dilation_w; uint groups;
+};
+#define AEXRT_TS 32u
+#define AEXRT_KB 32u
+/* +1 padding: the compute reads column k across many rows.  A 32-word row
+ * stride maps every row to the same LDS bank (32-way conflict); 33 words
+ * rotates the bank by row and makes the A/B tile reads conflict-free. */
+groupshared uint lts_a[AEXRT_TS][AEXRT_KB + 1u];
+groupshared uint lts_b[AEXRT_TS][AEXRT_KB + 1u];
+[numthreads(256, 1, 1)]
+void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
+    const uint spatial = out_h * out_w;
+    const uint icg_count = in_channels / 4u;
+    const uint pos0 = group_id.x * AEXRT_TS;
+    const uint oc0 = group_id.y * AEXRT_TS;
+    const uint n = group_id.z;
+    const uint pos_l = group_tid.x % AEXRT_TS;
+    const uint oc4_l = group_tid.x / AEXRT_TS;
+    const uint pos = pos0 + pos_l;
+    const uint oc00 = oc0 + oc4_l * 4u;
+    const bool pos_ok = pos < spatial;
+    const bool oc_ok = oc00 < out_channels;
+    float fp[4];
+    [unroll]
+    for (uint lane = 0u; lane < 4u; ++lane) fp[lane] = 0.0;
+
+    const uint kb_blocks = (icg_count + AEXRT_KB - 1u) / AEXRT_KB;
+    for (uint kb = 0u; kb < kb_blocks; ++kb) {
+        const uint icg0 = kb * AEXRT_KB;
+        const uint icg_n = min(AEXRT_KB, icg_count - icg0);
+        /* Coop-load A tile: 32 pos x KB (4 uints per thread). */
+        for (uint e = group_tid.x; e < AEXRT_TS * AEXRT_KB; e += 256u) {
+            const uint p = pos0 + e / AEXRT_KB;
+            const uint k = e % AEXRT_KB;
+            uint v = 0u;
+            if (p < spatial && k < icg_n) {
+                v = aexrt_input_q[(n * icg_count + icg0 + k) * spatial + p];
+            }
+            lts_a[e / AEXRT_KB][k] = v;
+        }
+        /* Coop-load B tile: 32 oc x KB. */
+        for (uint e = group_tid.x; e < AEXRT_TS * AEXRT_KB; e += 256u) {
+            const uint o = oc0 + e / AEXRT_KB;
+            const uint k = e % AEXRT_KB;
+            uint v = 0u;
+            if (o < out_channels && k < icg_n) {
+                v = aexrt_weight[o * icg_count + icg0 + k];
+            }
+            lts_b[e / AEXRT_KB][k] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (pos_ok && oc_ok) {
+            /* g16 slices: 4 icg each, int sub-chain then one float convert. */
+            [unroll]
+            for (uint g4 = 0u; g4 < AEXRT_KB / 4u; ++g4) {
+                if (g4 * 4u >= icg_n) break;
+                int sub[4];
+                [unroll]
+                for (uint lane = 0u; lane < 4u; ++lane) sub[lane] = 0;
+                [unroll]
+                for (uint q = 0u; q < 4u; ++q) {
+                    const uint a = lts_a[pos_l][g4 * 4u + q];
+                    [unroll]
+                    for (uint lane = 0u; lane < 4u; ++lane) {
+                        sub[lane] = dot4add_i8packed(a,
+                            lts_b[oc4_l * 4u + lane][g4 * 4u + q], sub[lane]);
+                    }
+                }
+                const float gs = asfloat(aexrt_amax[(icg0 + g4 * 4u) / 4u + 1u]) / 127.0;
+                [unroll]
+                for (uint lane = 0u; lane < 4u; ++lane) fp[lane] += float(sub[lane]) * gs;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (pos_ok && oc_ok) {
+        [unroll]
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            const uint oc = oc00 + lane;
+            if (oc >= out_channels) break;
+            float value = fp[lane] * aexrt_scale[oc] + aexrt_bias[oc];
+#ifdef AEXRT_INT8_SILU
+            value = value / (1.0 + exp(-value));
+#endif
+            aexrt_output[(n * out_channels + oc) * spatial + pos] = value;
+        }
+    }
+}
+)";
+    char entry_buf[64];
+    std::snprintf(entry_buf, sizeof(entry_buf), "aexrt_conv_int8_1x1_lts4%s", silu ? "_silu" : "");
+    D3D_SHADER_MACRO macros[3]{};
+    uint32_t macro_count = 0;
+    if (silu) macros[macro_count++] = {"AEXRT_INT8_SILU", "1"};
+    macros[macro_count++] = {nullptr, nullptr};
+    ComPtr<ID3DBlob> shader;
+    ComPtr<ID3DBlob> errs;
+    HRESULT hr = g_aexrt_engine_compile_model && g_aexrt_engine_use_dxil
+        ? aexrt_engine_d3d_compile(src, std::strlen(src), entry_buf,
+            macros, nullptr, "main", "cs_6_4", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+            &shader, &errs, "cs_6_4")
+        : aexrt_compile_dxil(src, std::strlen(src), macros, "main",
+            &shader, &errs, "cs_6_4");
+    if (FAILED(hr)) {
+        if (errs && errs->GetBufferPointer()) {
+            std::fprintf(stderr, "[conv int8 1x1 lts compile] %s\n",
+                static_cast<const char*>(errs->GetBufferPointer()));
+        }
+        return hr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = ctx->conv_int8_prequant_root_signature.Get();
+    pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+    return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
+}
+
 /* LDS-tiled int8 3x3 GEMM, stride 1 pad 1 (pg16 scales).
  *
  * Output tile: 8 cols x 4 rows (32 pos); input tile with halo: 10 x 6
@@ -3518,6 +3703,146 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
  * 128 threads owns 1 pos x 8 oc; its 9 taps read LDS only. Weights stream
  * from global (shared by the 32 pos threads, L1-resident). g16 slices of
  * 4 icg accumulate in int then convert once. */
+/* 2-oc/thread int8 1x1 LTS kernel (512 threads, 32 pos x 32 oc tile).
+ *
+ * Same GEMM tile and K-blocking as the 4-oc variant, but each thread owns two
+ * output channels, so total threads double. Short-spatial layers (10x10) cap
+ * at ~20% of the SM thread slots with 4 oc/thread; this variant trades some
+ * LDS reuse (1 A word feeds 2 instead of 4 dot4s) for occupancy.
+ */
+static HRESULT ensure_conv_int8_conv1x1_lts2o_pipeline(AexrtDevice* ctx, bool silu) {
+    if (!ctx) return E_INVALIDARG;
+    if (!aexrt_device_supports_int8_dot4(ctx)) return E_NOINTERFACE;
+    ComPtr<ID3D12PipelineState>* target = silu
+        ? std::addressof(ctx->conv_int8_prequant_conv1x1_lts2o_silu_pso)
+        : std::addressof(ctx->conv_int8_prequant_conv1x1_lts2o_linear_pso);
+    if (ctx->conv_int8_prequant_root_signature && *target) return S_OK;
+    {
+        HRESULT hr = ensure_conv_int8_prequant_pipeline(ctx, 1u, silu, true);
+        if (FAILED(hr)) return hr;
+    }
+    const char* src = R"(
+StructuredBuffer<uint> aexrt_input_q : register(t0);
+StructuredBuffer<uint> aexrt_weight : register(t1);
+StructuredBuffer<float> aexrt_scale : register(t2);
+StructuredBuffer<float> aexrt_bias : register(t3);
+StructuredBuffer<uint> aexrt_amax : register(t4);
+RWBuffer<float> aexrt_output : register(u0);
+cbuffer AexrtConv2DConstants : register(b0) {
+    uint batch; uint in_channels; uint in_h; uint in_w;
+    uint out_channels; uint out_h; uint out_w;
+    uint kernel_h; uint kernel_w; uint stride_h; uint stride_w;
+    uint pad_top; uint pad_left; uint dilation_h; uint dilation_w; uint groups;
+};
+#define AEXRT_TS 32u
+#define AEXRT_KB 32u
+#define AEXRT_LANES 2u
+groupshared uint lts_a[AEXRT_TS][AEXRT_KB + 1u];
+groupshared uint lts_b[AEXRT_TS][AEXRT_KB + 1u];
+[numthreads(512, 1, 1)]
+void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
+    const uint spatial = out_h * out_w;
+    const uint icg_count = in_channels / 4u;
+    const uint pos0 = group_id.x * AEXRT_TS;
+    const uint oc0 = group_id.y * AEXRT_TS;
+    const uint n = group_id.z;
+    const uint pos_l = group_tid.x % AEXRT_TS;
+    const uint oc2_l = group_tid.x / AEXRT_TS;   /* 0..15 */
+    const uint pos = pos0 + pos_l;
+    const uint oc00 = oc0 + oc2_l * AEXRT_LANES;
+    const bool pos_ok = pos < spatial;
+    const bool oc_ok = oc00 < out_channels;
+    float fp[AEXRT_LANES];
+    [unroll]
+    for (uint lane = 0u; lane < AEXRT_LANES; ++lane) fp[lane] = 0.0;
+
+    const uint kb_blocks = (icg_count + AEXRT_KB - 1u) / AEXRT_KB;
+    for (uint kb = 0u; kb < kb_blocks; ++kb) {
+        const uint icg0 = kb * AEXRT_KB;
+        const uint icg_n = min(AEXRT_KB, icg_count - icg0);
+        for (uint e = group_tid.x; e < AEXRT_TS * AEXRT_KB; e += 512u) {
+            const uint p = pos0 + e / AEXRT_KB;
+            const uint k = e % AEXRT_KB;
+            uint v = 0u;
+            if (p < spatial && k < icg_n) {
+                v = aexrt_input_q[(n * icg_count + icg0 + k) * spatial + p];
+            }
+            lts_a[e / AEXRT_KB][k] = v;
+        }
+        for (uint e = group_tid.x; e < AEXRT_TS * AEXRT_KB; e += 512u) {
+            const uint o = oc0 + e / AEXRT_KB;
+            const uint k = e % AEXRT_KB;
+            uint v = 0u;
+            if (o < out_channels && k < icg_n) {
+                v = aexrt_weight[o * icg_count + icg0 + k];
+            }
+            lts_b[e / AEXRT_KB][k] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (pos_ok && oc_ok) {
+            [unroll]
+            for (uint g4 = 0u; g4 < AEXRT_KB / 4u; ++g4) {
+                if (g4 * 4u >= icg_n) break;
+                int sub[AEXRT_LANES];
+                [unroll]
+                for (uint lane = 0u; lane < AEXRT_LANES; ++lane) sub[lane] = 0;
+                [unroll]
+                for (uint q = 0u; q < 4u; ++q) {
+                    const uint a = lts_a[pos_l][g4 * 4u + q];
+                    [unroll]
+                    for (uint lane = 0u; lane < AEXRT_LANES; ++lane) {
+                        sub[lane] = dot4add_i8packed(a,
+                            lts_b[oc2_l * AEXRT_LANES + lane][g4 * 4u + q], sub[lane]);
+                    }
+                }
+                const float gs = asfloat(aexrt_amax[(icg0 + g4 * 4u) / 4u + 1u]) / 127.0;
+                [unroll]
+                for (uint lane = 0u; lane < AEXRT_LANES; ++lane) fp[lane] += float(sub[lane]) * gs;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (pos_ok && oc_ok) {
+        [unroll]
+        for (uint lane = 0u; lane < AEXRT_LANES; ++lane) {
+            const uint oc = oc00 + lane;
+            if (oc >= out_channels) break;
+            float value = fp[lane] * aexrt_scale[oc] + aexrt_bias[oc];
+#ifdef AEXRT_INT8_SILU
+            value = value / (1.0 + exp(-value));
+#endif
+            aexrt_output[(n * out_channels + oc) * spatial + pos] = value;
+        }
+    }
+}
+)";
+    char entry_buf[64];
+    std::snprintf(entry_buf, sizeof(entry_buf), "aexrt_conv_int8_1x1_lts2o%s", silu ? "_silu" : "");
+    D3D_SHADER_MACRO macros[3]{};
+    uint32_t macro_count = 0;
+    if (silu) macros[macro_count++] = {"AEXRT_INT8_SILU", "1"};
+    macros[macro_count++] = {nullptr, nullptr};
+    ComPtr<ID3DBlob> shader;
+    ComPtr<ID3DBlob> errs;
+    HRESULT hr = g_aexrt_engine_compile_model && g_aexrt_engine_use_dxil
+        ? aexrt_engine_d3d_compile(src, std::strlen(src), entry_buf,
+            macros, nullptr, "main", "cs_6_4", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+            &shader, &errs, "cs_6_4")
+        : aexrt_compile_dxil(src, std::strlen(src), macros, "main",
+            &shader, &errs, "cs_6_4");
+    if (FAILED(hr)) {
+        if (errs && errs->GetBufferPointer()) {
+            std::fprintf(stderr, "[conv int8 1x1 lts2o compile] %s\n",
+                static_cast<const char*>(errs->GetBufferPointer()));
+        }
+        return hr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = ctx->conv_int8_prequant_root_signature.Get();
+    pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+    return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
+}
+
 static HRESULT ensure_conv_int8_conv3x3_lts_pipeline(AexrtDevice* ctx, bool silu) {
     if (!ctx) return E_INVALIDARG;
     if (!aexrt_device_supports_int8_dot4(ctx)) return E_NOINTERFACE;
@@ -3590,6 +3915,9 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
             }
             lts_a[ri * AEXRT_IWT + ci][k] = v;
         }
+        /* The halo tile is written and read by different lanes: a barrier is
+         * required before the compute phase (the older shader omitted it). */
+        GroupMemoryBarrierWithGroupSync();
 
         if (pos_ok) {
             [unroll]
@@ -3676,6 +4004,9 @@ static HRESULT ensure_conv_int8_conv3x3s2_lts_pipeline(AexrtDevice* ctx, bool si
     if (ctx->conv_int8_prequant_root_signature && *target) return S_OK;
     {
         HRESULT hr = ensure_conv_int8_prequant_pipeline(ctx, 32u, silu, true);
+        if (aexrt_env_flag("AEXRT_NATIVE_D3D12_TRACE_3X3S2"))
+            std::fprintf(stderr, "[ltsb] prequant hr=0x%08X rs=%p\n", static_cast<unsigned>(hr),
+                         static_cast<void*>(ctx->conv_int8_prequant_root_signature.Get()));
         if (FAILED(hr)) return hr;
     }
     const char* src = R"(
@@ -3809,6 +4140,338 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
     pso.pRootSignature = ctx->conv_int8_prequant_root_signature.Get();
     pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
     return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
+}
+
+/* 4-oc/thread stride-2 3x3 LTS kernel (256 threads, 8x4 pos x 32 oc tile).
+ *
+ * Same dataflow as the 8-oc version but with half the per-thread output
+ * channels and twice the threads. Stride-2 layers produce 4x fewer positions,
+ * so the 8-oc kernel leaves the SMs at ~8-13 warps; this variant doubles the
+ * resident warps without changing the A-tile staging or the weight stream.
+ */
+static HRESULT ensure_conv_int8_conv3x3s2_lts4_pipeline(AexrtDevice* ctx, bool silu) {
+    if (!ctx) return E_INVALIDARG;
+    if (!aexrt_device_supports_int8_dot4(ctx)) return E_NOINTERFACE;
+    ComPtr<ID3D12PipelineState>* target = silu
+        ? std::addressof(ctx->conv_int8_prequant_conv3x3s2_lts4_silu_pso)
+        : std::addressof(ctx->conv_int8_prequant_conv3x3s2_lts4_linear_pso);
+    if (ctx->conv_int8_prequant_root_signature && *target) return S_OK;
+    {
+        HRESULT hr = ensure_conv_int8_prequant_pipeline(ctx, 32u, silu, true);
+        if (FAILED(hr)) return hr;
+    }
+    const char* src = R"(
+StructuredBuffer<uint> aexrt_input_q : register(t0);
+StructuredBuffer<uint> aexrt_weight : register(t1);
+StructuredBuffer<float> aexrt_scale : register(t2);
+StructuredBuffer<float> aexrt_bias : register(t3);
+StructuredBuffer<uint> aexrt_amax : register(t4);
+RWBuffer<float> aexrt_output : register(u0);
+cbuffer AexrtConv2DConstants : register(b0) {
+    uint batch; uint in_channels; uint in_h; uint in_w;
+    uint out_channels; uint out_h; uint out_w;
+    uint kernel_h; uint kernel_w; uint stride_h; uint stride_w;
+    uint pad_top; uint pad_left; uint dilation_h; uint dilation_w; uint groups;
+};
+#define AEXRT_TW 8u
+#define AEXRT_TH 4u
+#define AEXRT_IWT (AEXRT_TW + 2u)
+#define AEXRT_IHT (AEXRT_TH + 2u)
+#define AEXRT_KB 16u
+groupshared uint lts_a[AEXRT_IHT * AEXRT_IWT][AEXRT_KB];
+[numthreads(256, 1, 1)]
+void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
+    const uint spatial = out_h * out_w;
+    const uint icg_count = in_channels / 4u;
+    const uint tile = group_id.x;
+    const uint tiles_x = (out_w + AEXRT_TW - 1u) / AEXRT_TW;
+    const uint c0 = (tile % tiles_x) * AEXRT_TW;
+    const uint r0 = (tile / tiles_x) * AEXRT_TH;
+    const uint oc0 = group_id.y * 32u;
+    const uint n = group_id.z;
+    const uint pos_l = group_tid.x % 32u;
+    const uint oc4_l = group_tid.x / 32u;      /* 0..7 */
+    const uint pr = pos_l / AEXRT_TW;
+    const uint pc = pos_l % AEXRT_TW;
+    const uint oh = r0 + pr;
+    const uint ow = c0 + pc;
+    const uint oc00 = oc0 + oc4_l * 4u;
+    const bool pos_ok = oh < out_h && ow < out_w;
+    float fp[4];
+    [unroll]
+    for (uint lane = 0u; lane < 4u; ++lane) fp[lane] = 0.0;
+
+    const uint kb_blocks = (icg_count + AEXRT_KB - 1u) / AEXRT_KB;
+    for (uint kb = 0u; kb < kb_blocks; ++kb) {
+        const uint icg0 = kb * AEXRT_KB;
+        const uint icg_n = min(AEXRT_KB, icg_count - icg0);
+        for (uint e = group_tid.x; e < AEXRT_IHT * AEXRT_IWT * AEXRT_KB; e += 256u) {
+            const uint ri = e / (AEXRT_IWT * AEXRT_KB);
+            const uint rem = e % (AEXRT_IWT * AEXRT_KB);
+            const uint ci = rem / AEXRT_KB;
+            const uint k = rem % AEXRT_KB;
+            const int ih = int(r0) * 2 - 1 + int(ri);
+            const int iw = int(c0) * 2 - 1 + int(ci);
+            uint v = 0u;
+            if (k < icg_n && ih >= 0 && ih < int(in_h) && iw >= 0 && iw < int(in_w)) {
+                v = aexrt_input_q[(n * icg_count + icg0 + k) * (in_h * in_w)
+                                  + uint(ih) * in_w + uint(iw)];
+            }
+            lts_a[ri * AEXRT_IWT + ci][k] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (pos_ok) {
+            [unroll]
+            for (uint g4 = 0u; g4 < AEXRT_KB / 4u; ++g4) {
+                if (g4 * 4u >= icg_n) break;
+                int sub[4];
+                [unroll]
+                for (uint lane = 0u; lane < 4u; ++lane) sub[lane] = 0;
+                [unroll]
+                for (uint kk = 0u; kk < 9u; ++kk) {
+                    const uint ky = kk / 3u;
+                    const uint kx = kk - ky * 3u;
+                    const uint ar = (2u * pr + ky) * AEXRT_IWT + (2u * pc + kx);
+                    const uint a0 = lts_a[ar][g4 * 4u + 0u];
+                    const uint a1 = lts_a[ar][g4 * 4u + 1u];
+                    const uint a2 = lts_a[ar][g4 * 4u + 2u];
+                    const uint a3 = lts_a[ar][g4 * 4u + 3u];
+                    [unroll]
+                    for (uint lane = 0u; lane < 4u; ++lane) {
+                        const uint w_base = ((oc00 + lane) * 9u + kk) * icg_count + icg0 + g4 * 4u;
+                        sub[lane] = dot4add_i8packed(a3, aexrt_weight[w_base + 3u],
+                            dot4add_i8packed(a2, aexrt_weight[w_base + 2u],
+                            dot4add_i8packed(a1, aexrt_weight[w_base + 1u],
+                            dot4add_i8packed(a0, aexrt_weight[w_base], sub[lane]))));
+                    }
+                }
+                const float gs = asfloat(aexrt_amax[(icg0 + g4 * 4u) / 4u + 1u]) / 127.0;
+                [unroll]
+                for (uint lane = 0u; lane < 4u; ++lane) fp[lane] += float(sub[lane]) * gs;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (pos_ok) {
+        [unroll]
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            const uint oc = oc00 + lane;
+            if (oc >= out_channels) break;
+            float value = fp[lane] * aexrt_scale[oc] + aexrt_bias[oc];
+#ifdef AEXRT_INT8_SILU
+            value = value / (1.0 + exp(-value));
+#endif
+            aexrt_output[(n * out_channels + oc) * spatial + oh * out_w + ow] = value;
+        }
+    }
+}
+)";
+    char entry_buf[64];
+    std::snprintf(entry_buf, sizeof(entry_buf), "aexrt_conv_int8_3x3s2_lts4%s", silu ? "_silu" : "");
+    D3D_SHADER_MACRO macros[3]{};
+    uint32_t macro_count = 0;
+    if (silu) macros[macro_count++] = {"AEXRT_INT8_SILU", "1"};
+    macros[macro_count++] = {nullptr, nullptr};
+    ComPtr<ID3DBlob> shader;
+    ComPtr<ID3DBlob> errs;
+    HRESULT hr = g_aexrt_engine_compile_model && g_aexrt_engine_use_dxil
+        ? aexrt_engine_d3d_compile(src, std::strlen(src), entry_buf,
+            macros, nullptr, "main", "cs_6_4", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+            &shader, &errs, "cs_6_4")
+        : aexrt_compile_dxil(src, std::strlen(src), macros, "main",
+            &shader, &errs, "cs_6_4");
+    if (FAILED(hr)) {
+        if (errs && errs->GetBufferPointer()) {
+            std::fprintf(stderr, "[conv int8 3x3s2 lts4 compile] %s\n",
+                static_cast<const char*>(errs->GetBufferPointer()));
+        }
+        return hr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = ctx->conv_int8_prequant_root_signature.Get();
+    pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+    return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
+}
+
+static HRESULT ensure_conv_int8_conv3x3s2_ltsb_pipeline(AexrtDevice* ctx, bool silu) {
+    if (!ctx) return E_INVALIDARG;
+    if (!aexrt_device_supports_int8_dot4(ctx)) return E_NOINTERFACE;
+    ComPtr<ID3D12PipelineState>* target = silu
+        ? std::addressof(ctx->conv_int8_prequant_conv3x3s2_ltsb_silu_pso)
+        : std::addressof(ctx->conv_int8_prequant_conv3x3s2_ltsb_linear_pso);
+    if (ctx->conv_int8_prequant_root_signature && *target) return S_OK;
+    {
+        HRESULT hr = ensure_conv_int8_prequant_pipeline(ctx, 32u, silu, true);
+        if (FAILED(hr)) return hr;
+    }
+    const char* src = R"(
+StructuredBuffer<uint> aexrt_input_q : register(t0);
+StructuredBuffer<uint> aexrt_weight : register(t1);
+StructuredBuffer<float> aexrt_scale : register(t2);
+StructuredBuffer<float> aexrt_bias : register(t3);
+StructuredBuffer<uint> aexrt_amax : register(t4);
+RWBuffer<float> aexrt_output : register(u0);
+cbuffer AexrtConv2DConstants : register(b0) {
+    uint batch; uint in_channels; uint in_h; uint in_w;
+    uint out_channels; uint out_h; uint out_w;
+    uint kernel_h; uint kernel_w; uint stride_h; uint stride_w;
+    uint pad_top; uint pad_left; uint dilation_h; uint dilation_w; uint groups;
+};
+#define AEXRT_TW 8u
+#define AEXRT_TH 4u
+#define AEXRT_IWT 17u
+#define AEXRT_IHT 9u
+#define AEXRT_KB 8u
+groupshared uint lts_a[AEXRT_IHT * AEXRT_IWT][AEXRT_KB];
+groupshared uint lts_b[32u][9u * AEXRT_KB + 1u];
+[numthreads(128, 1, 1)]
+void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
+    const uint spatial = out_h * out_w;
+    const uint icg_count = in_channels / 4u;
+    const uint tile = group_id.x;
+    const uint tiles_x = (out_w + AEXRT_TW - 1u) / AEXRT_TW;
+    const uint c0 = (tile % tiles_x) * AEXRT_TW;
+    const uint r0 = (tile / tiles_x) * AEXRT_TH;
+    const uint oc0 = group_id.y * 32u;
+    const uint n = group_id.z;
+    const uint pos_l = group_tid.x % 32u;
+    const uint oc8_l = group_tid.x / 32u;
+    const uint pr = pos_l / AEXRT_TW;
+    const uint pc = pos_l % AEXRT_TW;
+    const uint oh = r0 + pr;
+    const uint ow = c0 + pc;
+    const uint oc00 = oc0 + oc8_l * 8u;
+    const bool pos_ok = oh < out_h && ow < out_w;
+    float fp[8];
+    [unroll]
+    for (uint lane = 0u; lane < 8u; ++lane) fp[lane] = 0.0;
+
+    const uint kb_blocks = (icg_count + AEXRT_KB - 1u) / AEXRT_KB;
+    for (uint kb = 0u; kb < kb_blocks; ++kb) {
+        const uint icg0 = kb * AEXRT_KB;
+        const uint icg_n = min(AEXRT_KB, icg_count - icg0);
+        for (uint e = group_tid.x; e < AEXRT_IHT * AEXRT_IWT * AEXRT_KB; e += 128u) {
+            const uint ri = e / (AEXRT_IWT * AEXRT_KB);
+            const uint rem = e % (AEXRT_IWT * AEXRT_KB);
+            const uint ci = rem / AEXRT_KB;
+            const uint k = rem % AEXRT_KB;
+            const int ih = int(r0) * 2 - 1 + int(ri);
+            const int iw = int(c0) * 2 - 1 + int(ci);
+            uint v = 0u;
+            if (k < icg_n && ih >= 0 && ih < int(in_h) && iw >= 0 && iw < int(in_w)) {
+                v = aexrt_input_q[(n * icg_count + icg0 + k) * (in_h * in_w)
+                                  + uint(ih) * in_w + uint(iw)];
+            }
+            lts_a[ri * AEXRT_IWT + ci][k] = v;
+        }
+        /* Coop-load B tile: 32 oc x 9 taps x KB (weights were streamed from
+         * global in the base kernel; staging them here halves the per-oc
+         * weight traffic while keeping LDS at ~14 KB). */
+        for (uint e = group_tid.x; e < 32u * 9u * AEXRT_KB; e += 128u) {
+            const uint o = e / (9u * AEXRT_KB);
+            const uint rem = e % (9u * AEXRT_KB);
+            const uint kk_w = rem / AEXRT_KB;
+            const uint k = rem % AEXRT_KB;
+            uint v = 0u;
+            if (oc0 + o < out_channels && k < icg_n) {
+                v = aexrt_weight[((oc0 + o) * 9u + kk_w) * icg_count + icg0 + k];
+            }
+            lts_b[o][kk_w * AEXRT_KB + k] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (pos_ok) {
+            [unroll]
+            for (uint g4 = 0u; g4 < AEXRT_KB / 4u; ++g4) {
+                if (g4 * 4u >= icg_n) break;
+                int sub[8];
+                [unroll]
+                for (uint lane = 0u; lane < 8u; ++lane) sub[lane] = 0;
+                [unroll]
+                for (uint kk = 0u; kk < 9u; ++kk) {
+                    const uint ky = kk / 3u;
+                    const uint kx = kk - ky * 3u;
+                    const uint ar = (2u * pr + ky) * AEXRT_IWT + (2u * pc + kx);
+                    const uint a0 = lts_a[ar][g4 * 4u + 0u];
+                    const uint a1 = lts_a[ar][g4 * 4u + 1u];
+                    const uint a2 = lts_a[ar][g4 * 4u + 2u];
+                    const uint a3 = lts_a[ar][g4 * 4u + 3u];
+                    [unroll]
+                    const uint wk = kk * AEXRT_KB + g4 * 4u;
+                    [unroll]
+                    for (uint lane = 0u; lane < 8u; ++lane) {
+                        const uint ocw = oc8_l * 8u + lane;
+                        sub[lane] = dot4add_i8packed(a3, lts_b[ocw][wk + 3u],
+                            dot4add_i8packed(a2, lts_b[ocw][wk + 2u],
+                            dot4add_i8packed(a1, lts_b[ocw][wk + 1u],
+                            dot4add_i8packed(a0, lts_b[ocw][wk], sub[lane]))));
+                    }
+                }
+                const float gs = asfloat(aexrt_amax[(icg0 + g4 * 4u) / 4u + 1u]) / 127.0;
+                [unroll]
+                for (uint lane = 0u; lane < 8u; ++lane) fp[lane] += float(sub[lane]) * gs;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (pos_ok) {
+        [unroll]
+        for (uint lane = 0u; lane < 8u; ++lane) {
+            const uint oc = oc00 + lane;
+            if (oc >= out_channels) break;
+            float value = fp[lane] * aexrt_scale[oc] + aexrt_bias[oc];
+#ifdef AEXRT_INT8_SILU
+            value = value / (1.0 + exp(-value));
+#endif
+            aexrt_output[(n * out_channels + oc) * spatial + oh * out_w + ow] = value;
+        }
+    }
+}
+)";
+    char entry_buf[64];
+    std::snprintf(entry_buf, sizeof(entry_buf), "aexrt_conv_int8_3x3s2_ltsb%s", silu ? "_silu" : "");
+    D3D_SHADER_MACRO macros[3]{};
+    uint32_t macro_count = 0;
+    if (silu) macros[macro_count++] = {"AEXRT_INT8_SILU", "1"};
+    macros[macro_count++] = {nullptr, nullptr};
+    ComPtr<ID3DBlob> shader;
+    ComPtr<ID3DBlob> errs;
+    HRESULT hr = g_aexrt_engine_compile_model && g_aexrt_engine_use_dxil
+        ? aexrt_engine_d3d_compile(src, std::strlen(src), entry_buf,
+            macros, nullptr, "main", "cs_6_4", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+            &shader, &errs, "cs_6_4")
+        : aexrt_compile_dxil(src, std::strlen(src), macros, "main",
+            &shader, &errs, "cs_6_4");
+    if (FAILED(hr)) {
+        if (errs && errs->GetBufferPointer()) {
+            std::fprintf(stderr, "[conv int8 3x3s2 lts compile] %s\n",
+                static_cast<const char*>(errs->GetBufferPointer()));
+        }
+        return hr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = ctx->conv_int8_prequant_root_signature.Get();
+    pso.CS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+    return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(target->ReleaseAndGetAddressOf()));
+}
+
+/* 4-oc/thread stride-2 3x3 LTS kernel (256 threads, 8x4 pos x 32 oc tile).
+ *
+ * Same dataflow as the 8-oc version but with half the per-thread output
+ * channels and twice the threads. Stride-2 layers produce 4x fewer positions,
+ * so the 8-oc kernel leaves the SMs at ~8-13 warps; this variant doubles the
+ * resident warps without changing the A-tile staging or the weight stream.
+ */
+
+/* K-split factor for the int8 prequant path (small spatial + large K). The
+ * split hides latency by running K chunks in parallel before the combine
+ * kernel; the best factor is shape/device dependent, so leave it tunable. */
+static uint32_t int8_k_splits(void) {
+    const char* v = std::getenv("AEXRT_NATIVE_D3D12_INT8_KSPLITS");
+    if (!v) return 4u;
+    int n = std::atoi(v);
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    return static_cast<uint32_t>(n);
 }
 
 static HRESULT ensure_int8_ks_partial_pipeline(AexrtDevice* ctx, bool silu, bool per_group = false, uint32_t family = 3u) {
@@ -9858,6 +10521,173 @@ void main(uint3 tid : SV_DispatchThreadID) {
     return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(&target));
 }
 
+
+/* concat_conv1x1 OC-blocked variant: 16 oc per thread (4x input reuse).
+ * The 4-oc/thread kernel re-reads every activation once per oc4 block, so a
+ * 192->256 layer moves 4x more activation bytes than necessary.  This kernel
+ * keeps one float4 accumulator per oc quartet and loads v0..v3 once per
+ * channel quad, cutting activation traffic 4x.  Weights stay float4 and are
+ * broadcast across the position lanes of a warp. */
+static HRESULT ensure_concat_conv1x1_vec4x4_pipeline(AexrtDevice* ctx, bool silu) {
+    ComPtr<ID3D12PipelineState>& target = silu
+        ? ctx->concat_conv1x1_vec4x4_silu_pso
+        : ctx->concat_conv1x1_vec4x4_linear_pso;
+    if (ctx->concat_conv_root_signature && target) return S_OK;
+    if (!ctx->concat_conv_root_signature) {
+        HRESULT hr = ensure_concat_conv1x1_pipeline(ctx, silu);
+        if (FAILED(hr)) return hr;
+    }
+    const char* shader_source = R"(
+StructuredBuffer<float> input0 : register(t0);
+StructuredBuffer<float> input1 : register(t1);
+StructuredBuffer<float> input2 : register(t2);
+StructuredBuffer<float> input3 : register(t3);
+StructuredBuffer<float> input4 : register(t4);
+StructuredBuffer<float> input5 : register(t5);
+StructuredBuffer<float> input6 : register(t6);
+StructuredBuffer<float> input7 : register(t7);
+StructuredBuffer<float4> weight4 : register(t8);
+StructuredBuffer<float> bias : register(t9);
+RWStructuredBuffer<float> output : register(u0);
+cbuffer AexrtConcatConvConstants : register(b0) {
+    uint batch;
+    uint total_in_channels;
+    uint height;
+    uint width;
+    uint out_channels;
+    uint out_h;
+    uint out_w;
+    uint input_count;
+    uint c0;
+    uint c1;
+    uint c2;
+    uint c3;
+    uint c4;
+    uint c5;
+    uint c6;
+    uint c7;
+};
+float read_input(uint branch, uint idx) {
+    if (branch == 0) return input0[idx];
+    if (branch == 1) return input1[idx];
+    if (branch == 2) return input2[idx];
+    if (branch == 3) return input3[idx];
+    if (branch == 4) return input4[idx];
+    if (branch == 5) return input5[idx];
+    if (branch == 6) return input6[idx];
+    return input7[idx];
+}
+uint branch_channels(uint branch) {
+    if (branch == 0) return c0;
+    if (branch == 1) return c1;
+    if (branch == 2) return c2;
+    if (branch == 3) return c3;
+    if (branch == 4) return c4;
+    if (branch == 5) return c5;
+    if (branch == 6) return c6;
+    return c7;
+}
+void mac4(float v0, float v1, float v2, float v3,
+          float4 w0, float4 w1, float4 w2, float4 w3, inout float4 a) {
+    a.x += v0 * w0.x + v1 * w0.y + v2 * w0.z + v3 * w0.w;
+    a.y += v0 * w1.x + v1 * w1.y + v2 * w1.z + v3 * w1.w;
+    a.z += v0 * w2.x + v1 * w2.y + v2 * w2.z + v3 * w2.w;
+    a.w += v0 * w3.x + v1 * w3.y + v2 * w3.z + v3 * w3.w;
+}
+[numthreads(128, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint idx = tid.x;
+    uint oc_blocks = out_channels / 16u;
+    uint total = batch * oc_blocks * out_h * out_w;
+    if (idx >= total) return;
+    uint x = idx % out_w;
+    uint t = idx / out_w;
+    uint y = t % out_h;
+    t = t / out_h;
+    uint oc16 = t % oc_blocks;
+    uint n = t / oc_blocks;
+    uint spatial = y * width + x;
+    uint plane = height * width;
+    uint oc0 = oc16 * 16u;
+
+    float4 fa = float4(bias[oc0 + 0u], bias[oc0 + 1u], bias[oc0 + 2u], bias[oc0 + 3u]);
+    float4 fb = float4(bias[oc0 + 4u], bias[oc0 + 5u], bias[oc0 + 6u], bias[oc0 + 7u]);
+    float4 fc = float4(bias[oc0 + 8u], bias[oc0 + 9u], bias[oc0 + 10u], bias[oc0 + 11u]);
+    float4 fd = float4(bias[oc0 + 12u], bias[oc0 + 13u], bias[oc0 + 14u], bias[oc0 + 15u]);
+    uint quad_stride = total_in_channels / 4u;
+    uint weight_row0 = oc0 * quad_stride;
+    uint channel_base = 0u;
+    [unroll]
+    for (uint b = 0u; b < 8u; ++b) {
+        uint channels = branch_channels(b);
+        if (b >= input_count || channels == 0u) continue;
+        uint quads = channels / 4u;
+        uint cbase4 = channel_base / 4u;
+        uint input_base = (n * channels) * plane + spatial;
+        [loop]
+        for (uint q = 0u; q < quads; ++q) {
+            float v0 = read_input(b, input_base + (q * 4u + 0u) * plane);
+            float v1 = read_input(b, input_base + (q * 4u + 1u) * plane);
+            float v2 = read_input(b, input_base + (q * 4u + 2u) * plane);
+            float v3 = read_input(b, input_base + (q * 4u + 3u) * plane);
+            uint wb = weight_row0 + cbase4 + q;
+            mac4(v0, v1, v2, v3, weight4[wb], weight4[wb + quad_stride],
+                 weight4[wb + 2u * quad_stride], weight4[wb + 3u * quad_stride], fa);
+            wb += 4u * quad_stride;
+            mac4(v0, v1, v2, v3, weight4[wb], weight4[wb + quad_stride],
+                 weight4[wb + 2u * quad_stride], weight4[wb + 3u * quad_stride], fb);
+            wb += 4u * quad_stride;
+            mac4(v0, v1, v2, v3, weight4[wb], weight4[wb + quad_stride],
+                 weight4[wb + 2u * quad_stride], weight4[wb + 3u * quad_stride], fc);
+            wb += 4u * quad_stride;
+            mac4(v0, v1, v2, v3, weight4[wb], weight4[wb + quad_stride],
+                 weight4[wb + 2u * quad_stride], weight4[wb + 3u * quad_stride], fd);
+        }
+        channel_base += channels;
+    }
+#ifdef AEXRT_SILU
+    fa = fa / (1.0 + exp(-fa));
+    fb = fb / (1.0 + exp(-fb));
+    fc = fc / (1.0 + exp(-fc));
+    fd = fd / (1.0 + exp(-fd));
+#endif
+    uint out_plane = out_h * out_w;
+    uint out_base = ((n * out_channels + oc0) * out_plane) + y * out_w + x;
+    output[out_base + 0u * out_plane] = fa.x;
+    output[out_base + 1u * out_plane] = fa.y;
+    output[out_base + 2u * out_plane] = fa.z;
+    output[out_base + 3u * out_plane] = fa.w;
+    output[out_base + 4u * out_plane] = fb.x;
+    output[out_base + 5u * out_plane] = fb.y;
+    output[out_base + 6u * out_plane] = fb.z;
+    output[out_base + 7u * out_plane] = fb.w;
+    output[out_base + 8u * out_plane] = fc.x;
+    output[out_base + 9u * out_plane] = fc.y;
+    output[out_base + 10u * out_plane] = fc.z;
+    output[out_base + 11u * out_plane] = fc.w;
+    output[out_base + 12u * out_plane] = fd.x;
+    output[out_base + 13u * out_plane] = fd.y;
+    output[out_base + 14u * out_plane] = fd.z;
+    output[out_base + 15u * out_plane] = fd.w;
+}
+)";
+    D3D_SHADER_MACRO silu_macros[] = {
+        {"AEXRT_SILU", "1"},
+        {nullptr, nullptr},
+    };
+    ComPtr<ID3DBlob> shader;
+    ComPtr<ID3DBlob> errors;
+    HRESULT hr = D3DCompile(shader_source, std::strlen(shader_source),
+        "aexrt_concat_conv1x1_vec4x4_float32", silu ? silu_macros : nullptr, nullptr,
+        "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
+    if (FAILED(hr)) return hr;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = ctx->concat_conv_root_signature.Get();
+    pso.CS.pShaderBytecode = shader->GetBufferPointer();
+    pso.CS.BytecodeLength = shader->GetBufferSize();
+    return aexrt_create_compute_pipeline_state(ctx, &pso, IID_PPV_ARGS(&target));
+}
+
 /* gemm256：分块协作 GEMM。16x16 输出 tile（oc x pixel），K 每轮 32 通道，
  * A/B tile 经 groupshared 分块（padding 消 bank conflict），staging 阶段
  * 全 warp 连续地址 coalesced。针对 @10x10/@20x20 小空间大通道形状：
@@ -10038,7 +10868,9 @@ cbuffer AexrtConcatConvConstants : register(b0) {
 #define AEXRT_M_TILE 8u
 #define AEXRT_N_TILE 32u
 #define AEXRT_K_TILE 32u
-groupshared float w_tile[AEXRT_M_TILE * AEXRT_K_TILE];
+/* +1 padding: the 8 OC lanes of a warp read the same K column;
+ * a 32-float row stride maps them to one bank (8-way conflict). */
+groupshared float w_tile[AEXRT_M_TILE * (AEXRT_K_TILE + 1u)];
 groupshared float x_tile[AEXRT_K_TILE * AEXRT_N_TILE];
 
 uint branch_channels(uint branch) {
@@ -10104,7 +10936,7 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
             if (load_oc < out_channels && kg < total_in_channels) {
                 wv = weight[load_oc * total_in_channels + kg];
             }
-            w_tile[e] = wv;
+            w_tile[wm * (AEXRT_K_TILE + 1u) + wk] = wv;
         }
         for (uint xe = linear_tid; xe < AEXRT_K_TILE * AEXRT_N_TILE; xe += AEXRT_M_TILE * AEXRT_N_TILE) {
             uint xk = xe / AEXRT_N_TILE;
@@ -10129,7 +10961,7 @@ void main(uint3 group_id : SV_GroupID, uint3 group_tid : SV_GroupThreadID) {
             [unroll]
             for (uint kk = 0u; kk < AEXRT_K_TILE; ++kk) {
                 if (k_base + kk < total_in_channels) {
-                    acc += w_tile[local_m * AEXRT_K_TILE + kk] * x_tile[kk * AEXRT_N_TILE + local_n];
+                    acc += w_tile[local_m * (AEXRT_K_TILE + 1u) + kk] * x_tile[kk * AEXRT_N_TILE + local_n];
                 }
             }
         }
@@ -22503,13 +23335,21 @@ static bool match_position_winograd_residual_concat1x1_pattern(
         !shape_is(cv2_weight, 256u, 256u, 1u, 1u) ||
         !shape_is(cv2_bias, 1u, 1u, 1u, 256u) ||
         !shape_is(concat.output, 1u, 256u, 10u, 10u)) return false;
+    /* The input stage must be homogeneous; the fused epilogue may legally
+     * write fp32 from fp16 inputs (record flags bit2 set, bit3 clear).  The
+     * caller validates the output dtype against plan_output_fp16. */
     uint32_t stage_dtype = 0u;
-    for (uint32_t value_id : {conv.inputs[0], residual_value, branch_value, concat.output}) {
+    for (uint32_t value_id : {conv.inputs[0], residual_value, branch_value}) {
         const auto& value = model->replay_values[value_id];
         if ((value.engine_storage_dtype != 1u && value.engine_storage_dtype != 2u) ||
             value.engine_storage_layout != 1u) return false;
         if (stage_dtype == 0u) stage_dtype = value.engine_storage_dtype;
         else if (stage_dtype != value.engine_storage_dtype) return false;
+    }
+    {
+        const auto& out_value = model->replay_values[concat.output];
+        if ((out_value.engine_storage_dtype != 1u && out_value.engine_storage_dtype != 2u) ||
+            out_value.engine_storage_layout != 1u) return false;
     }
     for (uint32_t value_id : {conv_weight, conv_bias, cv2_weight, cv2_bias}) {
         if (!model->replay_values[value_id].is_constant) return false;
@@ -22642,14 +23482,20 @@ static bool match_position_winograd_residual_branch_concat1x1_pattern(
         !shape_is(cv2_weight, 256u, 256u, 1u, 1u) ||
         !shape_is(cv2_bias, 1u, 1u, 1u, 256u) ||
         !shape_is(concat.output, 1u, 256u, 20u, 20u)) return false;
+    /* Homogeneous input stage only; output dtype is validated by the caller. */
     uint32_t stage_dtype = 0u;
     for (uint32_t value_id : {
-            conv.inputs[0], residual_value, branch.inputs[0], concat.output}) {
+            conv.inputs[0], residual_value, branch.inputs[0]}) {
         const auto& value = model->replay_values[value_id];
         if ((value.engine_storage_dtype != 1u && value.engine_storage_dtype != 2u) ||
             value.engine_storage_layout != 1u) return false;
         if (stage_dtype == 0u) stage_dtype = value.engine_storage_dtype;
         else if (stage_dtype != value.engine_storage_dtype) return false;
+    }
+    {
+        const auto& out_value = model->replay_values[concat.output];
+        if ((out_value.engine_storage_dtype != 1u && out_value.engine_storage_dtype != 2u) ||
+            out_value.engine_storage_layout != 1u) return false;
     }
     for (uint32_t value_id : {
             conv_weight, conv_bias, branch_weight, branch_bias, cv2_weight, cv2_bias}) {
@@ -23977,7 +24823,11 @@ static HRESULT record_replay_conv(
                 SUCCEEDED(ensure_int8_ks_partial_pipeline(device, silu, int8_pergroup, family)) &&
                 SUCCEEDED(ensure_int8_ks_combine_pipeline(device, silu));
             if (use_ks) {
-                const uint32_t k_splits = 4u;
+                const uint32_t k_splits = int8_k_splits();
+                if (aexrt_env_flag("AEXRT_NATIVE_D3D12_TRACE_KSPLIT"))
+                    std::fprintf(stderr, "[ks] %ux%u ic=%u oc=%u k=%u\n",
+                                 desc.out_w, desc.out_h, desc.in_channels,
+                                 desc.out_channels, k_splits);
                 const uint32_t icg_count = desc.in_channels / 4u;
                 const uint32_t icg_per_slice = (icg_count + k_splits - 1u) / k_splits;
                 const uint64_t output_elements = uint64_t(desc.batch) * desc.out_channels * desc.out_h * desc.out_w;
@@ -24178,12 +25028,51 @@ static HRESULT record_replay_conv(
             uav_gpu.ptr += descriptor_size * 5;
             list->SetComputeRootSignature(device->conv_int8_prequant_root_signature.Get());
             ID3D12PipelineState* prequant_pso = nullptr;
+            if (aexrt_env_flag("AEXRT_NATIVE_D3D12_TRACE_3X3S2"))
+                std::fprintf(stderr, "[chain] fam=%u %ux%u ic=%u oc=%u s=%u pg=%d\n",
+                             family, desc.out_w, desc.out_h, desc.in_channels,
+                             desc.out_channels, desc.stride_h, (int)int8_pergroup);
             /* LDS-tiled GEMM for pg16 1x1 when the tile divides cleanly. */
             const bool lts_ok = family == 1u && int8_pergroup &&
                 (desc.out_channels % 32u) == 0u &&
                 !aexrt_env_flag("AEXRT_NATIVE_D3D12_DISABLE_1X1_LTS") &&
                 SUCCEEDED(ensure_conv_int8_conv1x1_lts_pipeline(device, silu));
-            if (lts_ok) {
+            /* Short-spatial 1x1 layers (10x10) do not have enough groups to
+             * fill the GPU; the 4-OC/thread variant doubles warps per group. */
+            const bool lts4_ok = lts_ok && desc.out_h * desc.out_w <= 512u &&
+                !aexrt_env_flag("AEXRT_NATIVE_D3D12_DISABLE_1X1_LTS4") &&
+                SUCCEEDED(ensure_conv_int8_conv1x1_lts4_pipeline(device, silu));
+            /* 2-oc/thread variant: same tile, twice the threads. Evaluated for
+             * short-spatial layers where the thread count caps occupancy. */
+            const bool lts2o_ok = lts_ok && desc.out_h * desc.out_w <= 512u &&
+                aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_1X1_LTS2O") &&
+                SUCCEEDED(ensure_conv_int8_conv1x1_lts2o_pipeline(device, silu));
+            /* Force the stride-2 B-staged variant for measurement even when
+             * the plan's normal selection would not reach it. */
+            HRESULT s2b_hr = E_FAIL;
+            const bool s2b_env = aexrt_env_flag("AEXRT_NATIVE_D3D12_FORCE_3X3S2_LTSB");
+            if (s2b_env) s2b_hr = ensure_conv_int8_conv3x3s2_ltsb_pipeline(device, silu);
+            if (aexrt_env_flag("AEXRT_NATIVE_D3D12_TRACE_3X3S2"))
+                std::fprintf(stderr, "[force] fam=%u env=%d hr=0x%08X\n",
+                             family, (int)s2b_env, static_cast<unsigned>(s2b_hr));
+            const bool force_s2b = family == 32u && int8_pergroup &&
+                (desc.out_channels % 32u) == 0u && desc.stride_h == 2u &&
+                desc.stride_w == 2u && desc.pad_top == 1u && desc.out_w >= 8u &&
+                desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
+                desc.in_channels >= 64u && s2b_env && SUCCEEDED(s2b_hr);
+            if (force_s2b) {
+                prequant_pso = silu
+                    ? device->conv_int8_prequant_conv3x3s2_ltsb_silu_pso.Get()
+                    : device->conv_int8_prequant_conv3x3s2_ltsb_linear_pso.Get();
+            } else if (lts2o_ok) {
+                prequant_pso = silu
+                    ? device->conv_int8_prequant_conv1x1_lts2o_silu_pso.Get()
+                    : device->conv_int8_prequant_conv1x1_lts2o_linear_pso.Get();
+            } else if (lts4_ok) {
+                prequant_pso = silu
+                    ? device->conv_int8_prequant_conv1x1_lts4_silu_pso.Get()
+                    : device->conv_int8_prequant_conv1x1_lts4_linear_pso.Get();
+            } else if (lts_ok) {
                 prequant_pso = silu
                     ? device->conv_int8_prequant_conv1x1_lts_silu_pso.Get()
                     : device->conv_int8_prequant_conv1x1_lts_linear_pso.Get();
@@ -24204,6 +25093,26 @@ static HRESULT record_replay_conv(
             else if (int8_pergroup && (desc.out_channels % 32u) == 0u &&
                 desc.stride_h == 2u && desc.stride_w == 2u && desc.pad_top == 1u &&
                 desc.out_w >= 8u && desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
+                desc.in_channels >= 64u && desc.out_h * desc.out_w <= 512u &&
+                aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_3X3S2_LTS4") &&
+                SUCCEEDED(ensure_conv_int8_conv3x3s2_lts4_pipeline(device, silu))) {
+                prequant_pso = silu
+                    ? device->conv_int8_prequant_conv3x3s2_lts4_silu_pso.Get()
+                    : device->conv_int8_prequant_conv3x3s2_lts4_linear_pso.Get();
+            }
+            else if (int8_pergroup && (desc.out_channels % 32u) == 0u &&
+                desc.stride_h == 2u && desc.stride_w == 2u && desc.pad_top == 1u &&
+                desc.out_w >= 8u && desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
+                desc.in_channels >= 64u &&
+                aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_3X3S2_LTSB") &&
+                SUCCEEDED(ensure_conv_int8_conv3x3s2_ltsb_pipeline(device, silu))) {
+                prequant_pso = silu
+                    ? device->conv_int8_prequant_conv3x3s2_ltsb_silu_pso.Get()
+                    : device->conv_int8_prequant_conv3x3s2_ltsb_linear_pso.Get();
+            }
+            else if (int8_pergroup && (desc.out_channels % 32u) == 0u &&
+                desc.stride_h == 2u && desc.stride_w == 2u && desc.pad_top == 1u &&
+                desc.out_w >= 8u && desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
                 desc.in_channels >= 64u &&
                 !aexrt_env_flag("AEXRT_NATIVE_D3D12_DISABLE_3X3S2_LTS") &&
                 SUCCEEDED(ensure_conv_int8_conv3x3s2_lts_pipeline(device, silu))) {
@@ -24218,6 +25127,12 @@ static HRESULT record_replay_conv(
             list->SetComputeRootDescriptorTable(0, srv_gpu);
             list->SetComputeRootDescriptorTable(1, uav_gpu);
             list->SetComputeRoot32BitConstants(2, 16, cmd.params.data(), 0);
+            if (lts4_ok || lts2o_ok) {
+                const UINT pos_tiles = (static_cast<UINT>(desc.out_h * desc.out_w) + 31u) / 32u;
+                const UINT oc_tiles = (desc.out_channels + 31u) / 32u;
+                list->Dispatch(pos_tiles, oc_tiles, desc.batch);
+                return S_OK;
+            }
             if (lts_ok) {
                 const UINT pos_tiles = (static_cast<UINT>(desc.out_h * desc.out_w) + 31u) / 32u;
                 const UINT oc_tiles = (desc.out_channels + 31u) / 32u;
@@ -24232,6 +25147,38 @@ static HRESULT record_replay_conv(
                     ? device->conv_int8_prequant_conv3x3_lts_silu_pso.Get()
                     : device->conv_int8_prequant_conv3x3_lts_linear_pso.Get());
             if (lts3) {
+                const UINT tiles_x = (desc.out_w + 7u) / 8u;
+                const UINT tiles_y = (desc.out_h + 3u) / 4u;
+                list->Dispatch(tiles_x * tiles_y, (desc.out_channels + 31u) / 32u, desc.batch);
+                return S_OK;
+            }
+            const bool lts_s2_4 = family == 32u && int8_pergroup && (desc.out_channels % 32u) == 0u &&
+                desc.stride_h == 2u && desc.stride_w == 2u && desc.pad_top == 1u &&
+                desc.out_w >= 8u && desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
+                desc.in_channels >= 64u &&
+                aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_3X3S2_LTS4") &&
+                prequant_pso == (silu
+                    ? device->conv_int8_prequant_conv3x3s2_lts4_silu_pso.Get()
+                    : device->conv_int8_prequant_conv3x3s2_lts4_linear_pso.Get());
+            if (lts_s2_4) {
+                const UINT tiles_x = (desc.out_w + 7u) / 8u;
+                const UINT tiles_y = (desc.out_h + 3u) / 4u;
+                list->Dispatch(tiles_x * tiles_y, (desc.out_channels + 31u) / 32u, desc.batch);
+                return S_OK;
+            }
+            const bool lts_s2_b = family == 32u && int8_pergroup && (desc.out_channels % 32u) == 0u &&
+                desc.stride_h == 2u && desc.stride_w == 2u && desc.pad_top == 1u &&
+                desc.out_w >= 8u && desc.in_h == 2u * desc.out_h && desc.in_w == 2u * desc.out_w &&
+                desc.in_channels >= 64u &&
+                (aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_3X3S2_LTSB") ||
+                 aexrt_env_flag("AEXRT_NATIVE_D3D12_FORCE_3X3S2_LTSB")) &&
+                prequant_pso == (silu
+                    ? device->conv_int8_prequant_conv3x3s2_ltsb_silu_pso.Get()
+                    : device->conv_int8_prequant_conv3x3s2_ltsb_linear_pso.Get());
+            if (lts_s2_b) {
+                if (aexrt_env_flag("AEXRT_NATIVE_D3D12_TRACE_3X3S2"))
+                    std::fprintf(stderr, "[3x3s2] ltsb %ux%u %u->%u\n",
+                                 desc.out_w, desc.out_h, desc.in_channels, desc.out_channels);
                 const UINT tiles_x = (desc.out_w + 7u) / 8u;
                 const UINT tiles_y = (desc.out_h + 3u) / 4u;
                 list->Dispatch(tiles_x * tiles_y, (desc.out_channels + 31u) / 32u, desc.batch);
@@ -24569,7 +25516,7 @@ static HRESULT record_replay_conv(
             SUCCEEDED(ensure_winograd_f2x2_ks_partial_pipeline(device)) &&
             SUCCEEDED(ensure_int8_ks_combine_pipeline(device, true));
         if (wks_ok) {
-            const uint32_t k_splits = 4u;
+            const uint32_t k_splits = int8_k_splits();
             const uint32_t blocks_per_slice = (wks_blocks + k_splits - 1u) / k_splits;
             const uint64_t output_elements = uint64_t(desc.batch) * desc.out_channels * desc.out_h * desc.out_w;
             AexrtBuffer*& wks_scratch = input_value.ks_partial_gpu;
@@ -26060,6 +27007,24 @@ static HRESULT record_replay_concat_conv1x1(
             }
         }
     }
+    /* 16-OC blocking: cut activation re-reads 4x versus the 4-OC vec4 path. */
+    bool use_vec4x4 = !use_native_fp16 && !use_tileflow_40x40_512x128 && !use_gemm &&
+        !activation_fp16_io && (out_channels % 16u) == 0u &&
+        (weight_value.gpu->element_offset % 4u) == 0u &&
+        (total_in_channels % 4u) == 0u &&
+        /* Experimental: neutral on RTX 5060 (fewer threads offset the 4x
+         * activation-traffic reduction); opt-in for shape/device sweeps. */
+        aexrt_env_flag("AEXRT_NATIVE_D3D12_ENABLE_CONCAT_CONV1X1_VEC4X4");
+    if (use_vec4x4) {
+        for (uint32_t i = 0; i < input_count; ++i) {
+            if ((channels[i] % 4u) != 0u) { use_vec4x4 = false; break; }
+        }
+    }
+    if (use_vec4x4) {
+        use_vec4 = false;
+        use_direct_pack4 = false;
+        use_gemm256 = false;
+    }
     HRESULT hr = S_OK;
     if (use_native_fp16) {
         hr = ensure_concat_conv1x1_native_fp16_oc8_pos2_pipeline(device, activation != 0);
@@ -26079,7 +27044,9 @@ static HRESULT record_replay_concat_conv1x1(
         AexrtShaderTargetScope fallback_scope(!requested_native_fp16 && (cmd.planned_flags & 2u) != 0);
         hr = use_tileflow_40x40_512x128
             ? ensure_concat_conv1x1_tileflow_40x40_512x128_pipeline(device)
-            : (use_gemm
+            : (use_vec4x4
+                ? ensure_concat_conv1x1_vec4x4_pipeline(device, activation != 0)
+                : (use_gemm
                 ? ensure_concat_conv1x1_gemm_pipeline(device, activation != 0)
                 : (use_direct_pack4
                     ? ensure_concat_conv1x1_direct_pack4_pipeline(device, activation != 0)
@@ -26087,8 +27054,12 @@ static HRESULT record_replay_concat_conv1x1(
                         ? ensure_concat_conv1x1_gemm256_pipeline(device, activation != 0)
                         : (use_vec4
                             ? ensure_concat_conv1x1_vec4_pipeline(device, activation != 0)
-                            : ensure_concat_conv1x1_pipeline(device, activation != 0)))));
-        if (use_gemm256 && FAILED(hr)) {
+                            : ensure_concat_conv1x1_pipeline(device, activation != 0))))));
+        if (use_vec4x4 && FAILED(hr)) {
+            use_vec4x4 = false;
+            use_vec4 = true;
+            hr = ensure_concat_conv1x1_vec4_pipeline(device, activation != 0);
+        } else if (use_gemm256 && FAILED(hr)) {
             use_gemm256 = false;
             hr = ensure_concat_conv1x1_vec4_pipeline(device, activation != 0);
             if (FAILED(hr)) {
@@ -26184,7 +27155,9 @@ static HRESULT record_replay_concat_conv1x1(
             : device->concat_conv1x1_native_fp16_oc8_pos2_linear_pso.Get())
         : (use_tileflow_40x40_512x128
         ? device->concat_conv1x1_tileflow_40x40_512x128_silu_pso.Get()
-        : (use_gemm
+        : (use_vec4x4
+            ? (activation ? device->concat_conv1x1_vec4x4_silu_pso.Get() : device->concat_conv1x1_vec4x4_linear_pso.Get())
+            : (use_gemm
             ? (activation ? device->concat_conv1x1_gemm_silu_pso.Get() : device->concat_conv1x1_gemm_linear_pso.Get())
             : (use_direct_pack4
                 ? (activation ? device->concat_conv1x1_direct_pack4_silu_pso.Get() : device->concat_conv1x1_direct_pack4_linear_pso.Get())
@@ -26192,7 +27165,7 @@ static HRESULT record_replay_concat_conv1x1(
                     ? (activation ? device->concat_conv1x1_gemm256_silu_pso.Get() : device->concat_conv1x1_gemm256_linear_pso.Get())
                     : (use_vec4
                         ? (activation ? device->concat_conv1x1_vec4_silu_pso.Get() : device->concat_conv1x1_vec4_linear_pso.Get())
-                        : (activation ? device->concat_conv1x1_silu_pso.Get() : device->concat_conv1x1_linear_pso.Get())))))));
+                        : (activation ? device->concat_conv1x1_silu_pso.Get() : device->concat_conv1x1_linear_pso.Get()))))))));
     list->SetComputeRootDescriptorTable(0, srv_gpu);
     list->SetComputeRootDescriptorTable(1, uav_gpu);
     list->SetComputeRoot32BitConstants(2, 16, constants, 0);
@@ -26214,6 +27187,9 @@ static HRESULT record_replay_concat_conv1x1(
         list->Dispatch(static_cast<UINT>((plane + 15) / 16),
                        static_cast<UINT>((out_channels + 15) / 16),
                        batch);
+    } else if (use_vec4x4) {
+        const UINT total = static_cast<UINT>(uint64_t(batch) * (out_channels / 16u) * height * width);
+        list->Dispatch((total + 127) / 128, 1, 1);
     } else if (use_vec4) {
         const UINT total = static_cast<UINT>(uint64_t(batch) * (out_channels / 4u) * height * width);
         list->Dispatch((total + 127) / 128, 1, 1);

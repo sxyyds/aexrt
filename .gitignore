@@ -28,3 +28,11 @@ Thumbs.db
 # Python packaging residue
 *.egg-info/
 dist/
+
+# AEXRT-M build outputs
+mobile/runtime/yolo_flat
+mobile/kernels/*.spv
+
+# Local audit snapshot (29MB) and Windows device-name artifact
+_aexrt_audit_20260927/
+nul

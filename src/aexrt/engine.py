@@ -2935,6 +2935,9 @@ def _build_fusion_plan(replay: dict[str, Any], *, precision: int, classes: int) 
 def _position_owned_winograd_residual_cv2_groups(
     replay: dict[str, Any], fusion_plan: Sequence[dict[str, int]]
 ) -> list[tuple[int, int, int]]:
+    import os as _os
+    if _os.environ.get("AEXRTC_UNFUSE_POSITION_WINOGRAD"):
+        return []
     commands = replay["commands"]
     values = replay["values"]
     producers = [-1] * len(values)
@@ -3028,6 +3031,9 @@ def _position_owned_winograd_residual_cv2_groups(
 def _position_owned_winograd_residual_branch_cv2_groups(
     replay: dict[str, Any],
 ) -> list[tuple[int, int, int, int]]:
+    import os as _os
+    if _os.environ.get("AEXRTC_UNFUSE_POSITION_WINOGRAD"):
+        return []
     commands = replay["commands"]
     values = replay["values"]
     producers = [-1] * len(values)

@@ -1,0 +1,129 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_spirv_intrinsics : require
+/* AEXRT-M W8A8 conv, position-major, 1 position x 8 OC.
+ *
+ * Activations and weights are int8.  Four channels are packed in one 32-bit
+ * word and multiplied with SPIR-V OpSDot (PackedVectorFormat4x8Bit), which
+ * maps to SDOT/DP4A on Mali.  Per-OC weight scales and the per-value
+ * activation scales are applied once after the int32 reduction; the epilogue
+ * quantizes to the next value's scale (quant_out=1) or writes fp16.
+ *
+ * Push constants: the first 20 fields match the f16 kernels; w_off is a
+ * 4-byte word offset, then in_scale, out_scale, quant_out, weight-scale
+ * float offset.
+ */
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6016, 6019], id = 4450)
+int spv_sdot(int a, int b, spirv_literal int fmt);
+
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer InQ  { int q[]; };
+layout(set = 0, binding = 1) readonly buffer WQ   { int wq[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer OutQ { int oq[]; };
+layout(set = 0, binding = 4) readonly buffer InS  { float16_t in_s[]; };
+layout(set = 0, binding = 5) readonly buffer WS   { float16_t w_s[]; };
+layout(set = 0, binding = 6) writeonly buffer OutH { f16vec4 outh[]; };
+layout(set = 0, binding = 7) readonly buffer WSc  { float w_scale[]; };
+
+layout(push_constant) uniform PC {
+    uint batch; uint in_c; uint in_h; uint in_w;
+    uint out_c; uint out_h; uint out_w;
+    uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint silu;
+    uint w_off; uint b_off; uint in_off; uint out_off;
+    uint out_ctot; uint in_ctot;
+    uint in_scale_bits; uint out_scale_bits; uint quant_out; uint s_off;
+} pc;
+
+uint pack4(int a, int b, int c, int d) {
+    return (uint(a) & 255u) | ((uint(b) & 255u) << 8) |
+           ((uint(c) & 255u) << 16) | ((uint(d) & 255u) << 24);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint spatial = pc.out_h * pc.out_w;
+    uint oc8 = (pc.out_c + 7u) / 8u;
+    uint total = pc.batch * oc8 * spatial;
+    if (idx >= total) return;
+    uint pos = idx % spatial;
+    uint t = idx / spatial;
+    uint oc8_idx = t % oc8;
+    uint n = t / oc8;
+    uint oh = pos / pc.out_w;
+    uint ow = pos - oh * pc.out_w;
+    uint oc0 = oc8_idx * 8u;
+
+    uint C4 = pc.in_c >> 2;
+    int a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
+    uint row_u = (((pc.in_c * pc.kh * pc.kw) + 3u) & ~3u) >> 2;
+    uint wbase = pc.w_off + oc0 * row_u;
+
+    for (uint kk = 0u; kk < pc.kh * pc.kw; ++kk) {
+        uint ky = kk / pc.kw;
+        uint kx = kk - ky * pc.kw;
+        int ih = int(oh * pc.sh + ky) - int(pc.ph);
+        int iw = int(ow * pc.sw + kx) - int(pc.pw);
+        if (ih < 0 || ih >= int(pc.in_h) || iw < 0 || iw >= int(pc.in_w)) continue;
+        uint ibase = ((uint(ih) * pc.in_w + uint(iw)) * pc.in_ctot + pc.in_off) >> 2;
+        uint wrow = wbase + kk * C4;
+        for (uint ic4 = 0u; ic4 < C4; ++ic4) {
+            int av = q[ibase + ic4];
+            a0 += spv_sdot(av, wq[wrow + ic4], 0);
+            a1 += spv_sdot(av, wq[wrow + ic4 + row_u], 0);
+            a2 += spv_sdot(av, wq[wrow + ic4 + 2u * row_u], 0);
+            a3 += spv_sdot(av, wq[wrow + ic4 + 3u * row_u], 0);
+            a4 += spv_sdot(av, wq[wrow + ic4 + 4u * row_u], 0);
+            a5 += spv_sdot(av, wq[wrow + ic4 + 5u * row_u], 0);
+            a6 += spv_sdot(av, wq[wrow + ic4 + 6u * row_u], 0);
+            a7 += spv_sdot(av, wq[wrow + ic4 + 7u * row_u], 0);
+        }
+    }
+
+    float in_scale = uintBitsToFloat(pc.in_scale_bits);
+    float out_scale = uintBitsToFloat(pc.out_scale_bits);
+    float y0 = 0.0, y1 = 0.0, y2 = 0.0, y3 = 0.0;
+    float y4 = 0.0, y5 = 0.0, y6 = 0.0, y7 = 0.0;
+    if (oc0 < pc.out_c)      y0 = float(a0) * in_scale * w_scale[pc.s_off + oc0] + b_data[pc.b_off + oc0];
+    if (oc0 + 1u < pc.out_c) y1 = float(a1) * in_scale * w_scale[pc.s_off + oc0 + 1u] + b_data[pc.b_off + oc0 + 1u];
+    if (oc0 + 2u < pc.out_c) y2 = float(a2) * in_scale * w_scale[pc.s_off + oc0 + 2u] + b_data[pc.b_off + oc0 + 2u];
+    if (oc0 + 3u < pc.out_c) y3 = float(a3) * in_scale * w_scale[pc.s_off + oc0 + 3u] + b_data[pc.b_off + oc0 + 3u];
+    if (oc0 + 4u < pc.out_c) y4 = float(a4) * in_scale * w_scale[pc.s_off + oc0 + 4u] + b_data[pc.b_off + oc0 + 4u];
+    if (oc0 + 5u < pc.out_c) y5 = float(a5) * in_scale * w_scale[pc.s_off + oc0 + 5u] + b_data[pc.b_off + oc0 + 5u];
+    if (oc0 + 6u < pc.out_c) y6 = float(a6) * in_scale * w_scale[pc.s_off + oc0 + 6u] + b_data[pc.b_off + oc0 + 6u];
+    if (oc0 + 7u < pc.out_c) y7 = float(a7) * in_scale * w_scale[pc.s_off + oc0 + 7u] + b_data[pc.b_off + oc0 + 7u];
+
+    if (pc.silu == 1u) {
+        y0 = y0 / (1.0 + exp(-y0)); y1 = y1 / (1.0 + exp(-y1));
+        y2 = y2 / (1.0 + exp(-y2)); y3 = y3 / (1.0 + exp(-y3));
+        y4 = y4 / (1.0 + exp(-y4)); y5 = y5 / (1.0 + exp(-y5));
+        y6 = y6 / (1.0 + exp(-y6)); y7 = y7 / (1.0 + exp(-y7));
+    } else if (pc.silu == 2u) {
+        y0 = 1.0 / (1.0 + exp(-y0)); y1 = 1.0 / (1.0 + exp(-y1));
+        y2 = 1.0 / (1.0 + exp(-y2)); y3 = 1.0 / (1.0 + exp(-y3));
+        y4 = 1.0 / (1.0 + exp(-y4)); y5 = 1.0 / (1.0 + exp(-y5));
+        y6 = 1.0 / (1.0 + exp(-y6)); y7 = 1.0 / (1.0 + exp(-y7));
+    }
+
+    uint obase = pos * pc.out_ctot + pc.out_off + oc0;
+    if (pc.quant_out != 0u) {
+        int q0 = clamp(int(round(y0 / out_scale)), -127, 127);
+        int q1 = clamp(int(round(y1 / out_scale)), -127, 127);
+        int q2 = clamp(int(round(y2 / out_scale)), -127, 127);
+        int q3 = clamp(int(round(y3 / out_scale)), -127, 127);
+        int q4 = clamp(int(round(y4 / out_scale)), -127, 127);
+        int q5 = clamp(int(round(y5 / out_scale)), -127, 127);
+        int q6 = clamp(int(round(y6 / out_scale)), -127, 127);
+        int q7 = clamp(int(round(y7 / out_scale)), -127, 127);
+        oq[obase >> 2] = int(pack4(q0, q1, q2, q3));
+        if (oc0 + 8u <= pc.out_c) oq[(obase + 4u) >> 2] = int(pack4(q4, q5, q6, q7));
+    } else {
+        if (oc0 + 8u <= pc.out_c) {
+            outh[obase >> 2] = f16vec4(vec4(y0, y1, y2, y3));
+            outh[(obase + 4u) >> 2] = f16vec4(vec4(y4, y5, y6, y7));
+        } else if (oc0 + 4u <= pc.out_c) {
+            outh[obase >> 2] = f16vec4(vec4(y0, y1, y2, y3));
+        }
+    }
+}

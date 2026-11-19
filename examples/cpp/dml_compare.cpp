@@ -179,7 +179,7 @@ struct AexrtResult {
 };
 
 AexrtResult run_aexrt(const ModelEntry& entry, uint32_t adapter_index, uint32_t warmup, uint32_t runs,
-                      uint32_t event_top_n, uint32_t pipeline_frames) {
+                      uint32_t event_top_n, uint32_t pipeline_frames, bool zero_copy) {
     AexrtResult result;
     try {
         aexrt::Device device(adapter_index);
@@ -202,12 +202,28 @@ AexrtResult run_aexrt(const ModelEntry& entry, uint32_t adapter_index, uint32_t 
 
         auto detections = aexrt::run_yolo(device, model, input, 64);
         result.detection_count = static_cast<uint32_t>(detections.size());
+        const float* run_input = input.data();
+        uint64_t run_elements = static_cast<uint64_t>(input.size());
+        if (zero_copy) {
+            uint64_t mapped_elements = 0;
+            void* mapped = aexrt::input_ptr(model, &mapped_elements);
+            if (!mapped || mapped_elements < input.size()) {
+                result.error = "zero-copy input pointer unavailable";
+                return result;
+            }
+            std::memcpy(mapped, input.data(), input.size() * sizeof(float));
+            run_input = static_cast<const float*>(mapped);
+        }
         for (uint32_t i = 0; i < warmup; ++i) {
-            detections = aexrt::run_yolo(device, model, input, 64);
+            detections = zero_copy
+                ? aexrt::run_yolo_ptr(device, model, run_input, run_elements, 64)
+                : aexrt::run_yolo(device, model, input, 64);
         }
         for (uint32_t i = 0; i < runs; ++i) {
             const double t0 = now_ms();
-            detections = aexrt::run_yolo(device, model, input, 64);
+            detections = zero_copy
+                ? aexrt::run_yolo_ptr(device, model, run_input, run_elements, 64)
+                : aexrt::run_yolo(device, model, input, 64);
             const double t1 = now_ms();
             e2e_samples.push_back(t1 - t0);
             const AexrtYoloRunTiming timing = model.last_run_timing();
@@ -371,6 +387,7 @@ int main(int argc, char** argv) {
     uint32_t dml_device = 0;
     uint32_t event_top_n = 15;
     uint32_t pipeline_frames = 1;
+    bool zero_copy = false;
     bool list_adapters = false;
     bool skip_aexrt = false;
     bool skip_dml = false;
@@ -419,11 +436,13 @@ int main(int argc, char** argv) {
             skip_dml = true;
         } else if (arg == "--warp") {
             use_warp = true;
+        } else if (arg == "--zero-copy") {
+            zero_copy = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "dml_compare.exe [--runs N] [--warmup M] [--models a,b,c]\n"
                 << "               [--adapter N | --warp] [--dml-device N] [--out file.md]\n"
-                << "               [--pipeline 1..4] [--skip-aexrt] [--skip-dml] [--list-adapters]\n";
+                << "               [--pipeline 1..4] [--zero-copy] [--skip-aexrt] [--skip-dml] [--list-adapters]\n";
             return 0;
         } else {
             std::cerr << "unknown argument: " << arg << "\n";
@@ -490,6 +509,8 @@ int main(int argc, char** argv) {
     report << "- aexrt pipeline frames: " << pipeline_frames
            << (pipeline_frames >= 2u ? " (N-buffer, run returns previous frame; flush at end)" : " (synchronous)")
            << "\n";
+    report << "- aexrt zero-copy input: " << (zero_copy ? "yes (mapped pointer, no per-frame host memcpy)" : "no")
+           << "\n";
     report << "- fairness: same deterministic input bytes; both paths include host->device upload; "
               "single thread; first-load compile excluded via warmup\n\n";
 
@@ -501,7 +522,7 @@ int main(int argc, char** argv) {
         if (!skip_aexrt) {
             std::cout << "running AEXRT engine (" << warmup << " warmup + " << runs
                       << " runs, pipeline=" << pipeline_frames << ")...\n";
-            aexrt = run_aexrt(entry, adapter_index, warmup, runs, event_top_n, pipeline_frames);
+            aexrt = run_aexrt(entry, adapter_index, warmup, runs, event_top_n, pipeline_frames, zero_copy);
             if (aexrt.ok) {
                 std::cout << "  AEXRT e2e median " << fmt(aexrt.e2e.median_ms)
                           << " (mean " << fmt(aexrt.e2e.mean_ms) << ", min " << fmt(aexrt.e2e.min_ms)
